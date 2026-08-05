@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "3ceratops"
+version = "0.1.0"
+description = "3D coordination-environment reconstruction from T-REX topology"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Ilia Kevlishvili", email = "ilia_kevlishvili@baylor.edu"},
+]
+maintainers = [
+    {name = "Ilia Kevlishvili", email = "ilia_kevlishvili@baylor.edu"},
+]
+keywords = [
+    "chemistry",
+    "computational chemistry",
+    "transition metals",
+    "coordination complexes",
+    "3D structure generation",
+    "T-REX",
+    "3CERATOPS",
+    "cheminformatics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20",
+    "rdkit>=2022.03",
+    "PuLP>=2.7",
+    "scipy>=1.8",
+    "trex-notation",
+]
+
+[project.scripts]
+3ceratops = "trex_geo.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "isort>=5.0",
+    "mypy>=1.0",
+]
+xtb = [
+    "ase>=3.22",
+    "xtb>=22.1",
+]
+ml = [
+    "torch>=2.0",
+    "torch-geometric>=2.3",
+]
+uma = [
+    "ase>=3.22",
+    "fairchem-core>=2.1",
+    "torch>=2.0",
+]
+all = [
+    "ase>=3.22",
+    "xtb>=22.1",
+    "torch>=2.0",
+    "torch-geometric>=2.3",
+    "fairchem-core>=2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/KevlishviliGroup/3ceratops"
+Documentation = "https://github.com/KevlishviliGroup/3ceratops#readme"
+Repository = "https://github.com/KevlishviliGroup/3ceratops"
+Issues = "https://github.com/KevlishviliGroup/3ceratops/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trex_geo*", "LF_GNN"]
+namespaces = false
+
+[tool.setuptools.package-data]
+trex_geo = ["py.typed"]
+LF_GNN = ["ensemble_gram/seed_*/best.pt"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

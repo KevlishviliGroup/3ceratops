@@ -1,0 +1,414 @@
+Metadata-Version: 2.4
+Name: 3ceratops
+Version: 0.1.0
+Summary: 3D coordination-environment reconstruction from T-REX topology
+Author-email: Ilia Kevlishvili <ilia_kevlishvili@baylor.edu>
+Maintainer-email: Ilia Kevlishvili <ilia_kevlishvili@baylor.edu>
+License: MIT
+Project-URL: Homepage, https://github.com/kevlishvili/3ceratops
+Project-URL: Documentation, https://github.com/kevlishvili/3ceratops#readme
+Project-URL: Repository, https://github.com/kevlishvili/3ceratops
+Project-URL: Issues, https://github.com/kevlishvili/3ceratops/issues
+Keywords: chemistry,computational chemistry,transition metals,coordination complexes,3D structure generation,T-REX,3-CERATOPS,cheminformatics
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Chemistry
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.20
+Requires-Dist: rdkit>=2022.03
+Requires-Dist: PuLP>=2.7
+Requires-Dist: scipy>=1.8
+Requires-Dist: trex-notation
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Requires-Dist: black>=23.0; extra == "dev"
+Requires-Dist: isort>=5.0; extra == "dev"
+Requires-Dist: mypy>=1.0; extra == "dev"
+Provides-Extra: xtb
+Requires-Dist: ase>=3.22; extra == "xtb"
+Requires-Dist: xtb>=22.1; extra == "xtb"
+Provides-Extra: ml
+Requires-Dist: torch>=2.0; extra == "ml"
+Requires-Dist: torch-geometric>=2.3; extra == "ml"
+Provides-Extra: uma
+Requires-Dist: ase>=3.22; extra == "uma"
+Requires-Dist: fairchem-core>=2.1; extra == "uma"
+Requires-Dist: torch>=2.0; extra == "uma"
+Provides-Extra: all
+Requires-Dist: ase>=3.22; extra == "all"
+Requires-Dist: xtb>=22.1; extra == "all"
+Requires-Dist: torch>=2.0; extra == "all"
+Requires-Dist: torch-geometric>=2.3; extra == "all"
+Requires-Dist: fairchem-core>=2.1; extra == "all"
+Dynamic: license-file
+
+# 3-CERATOPS
+
+**3D Coordination Environment Reconstruction from Abstract TOPology to Structure**
+
+3-CERATOPS converts T-REX strings into three-dimensional structures of
+transition-metal complexes. The installable distribution is named
+`3ceratops`; the Python import package remains `trex_geo`.
+
+The generator combines coordination-sphere reconstruction, constrained RDKit
+embedding, multi-seed conformer search, and either xTB or UMA relaxation. It is
+research software intended for structure generation followed by independent
+chemical validation and downstream electronic-structure calculations.
+
+## Installation
+
+Install from a local source checkout:
+
+```bash
+python -m pip install -e .
+```
+
+The T-REX parser is required at runtime. Install the T-REX package in the same
+environment, or install the `trex` extra if that name resolves to your intended
+T-REX distribution:
+
+```bash
+python -m pip install -e ".[trex]"
+```
+
+Choose the optimizer and prediction extras needed in your environment:
+
+```bash
+# xTB pipeline
+python -m pip install -e ".[xtb]"
+
+# LF-GNN internal-coordinate prediction
+python -m pip install -e ".[ml]"
+
+# UMA pipeline
+python -m pip install -e ".[uma]"
+```
+
+`xtb-python` is distributed on PyPI as `xtb` and on conda-forge as
+`xtb-python`. On HPC systems, conda-forge is often the most reliable route:
+
+```bash
+conda install -c conda-forge xtb-python ase
+```
+
+UMA additionally requires access to the gated UMA model files and a configured
+Hugging Face token. The first use downloads the selected model.
+
+### Dependency groups
+
+| Group | Packages and resources |
+|---|---|
+| Core | NumPy, RDKit, PuLP, SciPy, and the T-REX parser |
+| xTB | ASE and `xtb-python` (`xtb` import package) |
+| ML internals | PyTorch, PyTorch Geometric, `torch-scatter`, and LF-GNN checkpoints |
+| UMA | ASE, PyTorch, `fairchem-core`, UMA access, and a Hugging Face token |
+| Development | pytest, coverage, Black, isort, and mypy |
+
+## Quick start: xTB
+
+```python
+from trex_geo import trex_to_xyz
+
+trex_str = (
+    "Fe{+2}|"
+    "L=[SMILES:O,SMILES:O,SMILES:O,SMILES:O,SMILES:O,SMILES:O]|"
+    "MAP:{(1:1,2:1),(3:1,4:1),(5:1,6:1)}|"
+    "G:O"
+)
+
+result = trex_to_xyz(
+    trex_str,
+    use_idealized=True,
+    n_seeds=5,
+    top_k=3,
+    refine_gfn2=True,
+)
+
+if not result.success:
+    raise RuntimeError(result.error)
+
+print(result.mol.GetNumAtoms())
+print(result.energy)              # Hartree
+print(result.internals_source)    # provided, predicted, or idealized
+print(result.diagnostics)
+```
+
+The xTB pipeline performs constrained GFN-FF optimization for all successful
+seeds, retains the `top_k` lowest-energy candidates, and optionally refines the
+retained candidates with GFN2-xTB. The public function returns the best final
+candidate.
+
+## Quick start: UMA
+
+```python
+from trex_geo import trex_to_xyz_uma
+
+result = trex_to_xyz_uma(
+    trex_str,
+    use_idealized=True,
+    n_seeds=20,
+    top_k=5,
+    refine_medium=True,
+    refine_unconstrained=False,
+    device="cuda",
+)
+
+if not result.success:
+    raise RuntimeError(result.error)
+
+print(result.energy)  # converted to Hartree for API consistency
+print(result.diagnostics["best_method"])
+```
+
+The UMA pipeline screens all seeds with constrained `uma-s-1p1`, optionally
+refines the retained candidates with constrained `uma-m-1p1`, and can perform
+an additional unconstrained medium-model relaxation. Total charge and spin
+multiplicity are supplied to the UMA OMol task through `atoms.info`.
+
+## Internal-coordinate sources
+
+The priority is:
+
+1. explicit `internals` supplied by the caller;
+2. LF-GNN prediction, unless `use_idealized=True`;
+3. idealized values from `trex.geometry`.
+
+`model_path` must identify an ensemble directory containing
+`seed_*/best.pt` files (a flat directory of `.pt` files is also accepted). The
+source checkout currently defaults to:
+
+```text
+LF_GNN/ensemble_gram/seed_*/best.pt
+```
+
+The model checkpoints are not bundled by the package metadata in this version.
+Pass `model_path` explicitly if they are stored elsewhere. If the prediction
+stack, checkpoints, or inference are unavailable, the top-level pipelines log
+the problem and fall back to idealized internals. `result.internals_source`
+records the path actually used.
+
+Explicit internals use distances in angstrom and angle cosines:
+
+```python
+internals = {
+    "site_r": [2.30, 2.30, 2.05, 2.05],
+    "trans_cos": [-0.99, -0.99],
+    "cis_cos": [0.01, 0.01, -0.01, -0.01],
+    "cis_pair_indices": [(0, 2), (0, 3), (1, 2), (1, 3)],
+}
+
+result = trex_to_xyz(trex_str, internals=internals)
+```
+
+## Haptic sites
+
+The default `haptic_scale=0.35` contracts haptic ghost-site distances only for
+the constrained embedding stage. This is an empirical placement aid rather
+than a physical M-centroid distance. The unscaled M-centroid distance is used
+to construct haptic constraints during xTB or UMA relaxation.
+
+## Validation policy
+
+The top-level xTB and UMA generation functions intentionally skip T-REX
+round-trip validation because that operation is comparatively slow. For
+dataset construction, validate generated structures separately before use:
+
+```python
+from trex_geo.multiseed_trex_validate import validate_trex_roundtrip
+
+is_valid, reconstructed = validate_trex_roundtrip(
+    mol=result.mol,
+    original_trex=trex_str,
+    charge=0,
+    geometry="octahedral",
+)
+```
+
+The returned structure is still intended for subsequent DFT optimization; an
+xTB or UMA optimization result is not a substitute for that calculation.
+
+## Writing XYZ files
+
+```python
+from trex_geo import trex_to_xyz_file, trex_to_xyz_uma_file
+
+trex_to_xyz_file(trex_str, "xtb_structure.xyz", use_idealized=True)
+trex_to_xyz_uma_file(trex_str, "uma_structure.xyz", use_idealized=True)
+```
+
+`TrexToXyzResult.energy` and XYZ comment-line energies are in Hartree for both
+pipelines.
+
+## Command-line interface
+
+Use a file for T-REX input when possible so shell metacharacters in the line
+notation do not need additional quoting:
+
+```bash
+3ceratops generate \
+  --trex-file complex.trex \
+  --output complex.xyz \
+  --optimizer xtb \
+  --internals predicted \
+  --model-dir LF_GNN/ensemble_gram \
+  --n-seeds 5 \
+  --top-k 3
+```
+
+UMA generation uses the same command:
+
+```bash
+3ceratops generate \
+  --trex-file complex.trex \
+  --output complex_uma.xyz \
+  --optimizer uma \
+  --internals idealized \
+  --device cuda \
+  --n-seeds 20 \
+  --top-k 5 \
+  --refine-medium
+```
+
+A quoted inline string is also supported with `--trex`. Check a new environment
+before a production run with:
+
+```bash
+3ceratops doctor --model-dir LF_GNN/ensemble_gram
+```
+
+`doctor` reports core, xTB, ML, and UMA imports separately and checks for
+`seed_*/best.pt` model checkpoints. Optional stacks do not make the command
+fail; missing core requirements do.
+
+## Lower-level xTB API
+
+```python
+from trex.parse_full import parse_trex_full
+from trex_geo import (
+    compute_idealized_internals,
+    embed_trex_metallogen,
+    optimize_with_xtb,
+    reconstruct_coordination_sphere,
+)
+
+t = parse_trex_full(trex_str)
+internals = compute_idealized_internals(t)
+site_coords, _ = reconstruct_coordination_sphere(
+    t=t,
+    site_r=internals["site_r"],
+    trans_cos=internals["trans_cos"],
+    cis_cos=internals["cis_cos"],
+    cis_pair_indices=internals["cis_pair_indices"],
+    expected_chirality=t.X,
+)
+embedded = embed_trex_metallogen(t, site_coords, geometry="6_octahedral")
+
+if not embedded.success:
+    raise RuntimeError("embedding failed")
+
+opt = optimize_with_xtb(
+    embedded.mol,
+    metal_idx=embedded.metal_idx,
+    coord_atom_indices=embedded.coord_atom_indices,
+    haptic_infos=[],
+    charge=embedded.charge,
+    spin=embedded.spin,
+    method="GFN2-xTB",
+)
+
+if opt.success:
+    optimized_mol = opt.optimized_mol
+    energy_hartree = opt.energy
+```
+
+`optimize_with_xtb()` returns an `XTBResult`. Only the `xtb-python`/ASE backend
+is supported; the former subprocess backend has been removed.
+
+## Supported geometry mappings
+
+`TrexFull.get_geo_type()` can return inferred lowercase codes or explicit
+geometry flags. The current mapping is:
+
+| Geometry | Inferred code | Explicit code accepted here | CN |
+|---|---:|---:|---:|
+| Octahedral | `O` | `O` | 6 |
+| Square planar | `sqpl` | `SP` | 4 |
+| Square pyramidal | `sqpy` | `SQP` | 5 |
+| Tetrahedral | `thd` | `T` | 4 |
+| Trigonal bipyramidal | `trbp` | `TBP` | 5 |
+| Pentagonal bipyramidal | `pntbp` | — | 7 |
+| Linear | `ln` | `L` | 2 |
+| Bent | `bnt` | — | 2 |
+| Trigonal planar | `trpl` | `TP` | 3 |
+| Trigonal pyramidal | — | `TPY` | 3 |
+| T-shaped | `tsh` | — | 3 |
+| See-saw | `ssw` | — | 4 |
+
+## Examples
+
+Four standalone examples are provided:
+
+1. `examples/01_basic_xtb.py`
+2. `examples/02_explicit_internals.py`
+3. `examples/03_multiseed_predicted.py`
+4. `examples/04_uma_write.py`
+
+The command-line interface is implemented with the Python standard library and
+does not add a CLI framework dependency.
+
+## Limitations
+
+- The package is alpha research software and is not guaranteed to generate a
+  chemically appropriate structure for every T-REX input.
+- Final topological validation is deliberately external to generation.
+- Model checkpoints are large external resources in the current layout.
+- Generated structures should be inspected and optimized at the intended DFT
+  level before scientific interpretation.
+
+## Citation
+
+If you use 3-CERATOPS, cite the software release associated with the version
+you ran. A provisional software citation is:
+
+```bibtex
+@software{kevlishvili_3ceratops_2026,
+  author = {Kevlishvili, Ilia},
+  title = {3-CERATOPS: 3D Coordination Environment Reconstruction from
+           Abstract TOPology to Structure},
+  year = {2026},
+  url = {https://github.com/kevlishvili/3ceratops}
+}
+```
+
+Please also cite T-REX:
+
+```bibtex
+@article{kevlishvili_trex_2026,
+  author = {Kevlishvili, Ilia and Dorabawila, Devmin},
+  title = {Taming T-REX: a canonical language for geometry-aware generative
+           design of transition-metal complexes},
+  journal = {Digital Discovery},
+  year = {2026},
+  volume = {5},
+  pages = {2845},
+  doi = {10.1039/D6DD00129G}
+}
+```
+
+## License and acknowledgments
+
+3-CERATOPS is distributed under the MIT License. See `LICENSE`.
+
+- Bond-order assignment was adapted from MetalloGen under its BSD 3-Clause
+  License.
+- Coordination-sphere placement uses Gram-matrix distance reconstruction.
