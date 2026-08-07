@@ -154,6 +154,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
         "ML internals": [
             ("PyTorch", "torch"),
             ("PyTorch Geometric", "torch_geometric"),
+            ("torch-scatter", "torch_scatter"),
         ],
         "UMA": [("ASE", "ase"), ("fairchem-core", "fairchem")],
     }
@@ -173,6 +174,55 @@ def _run_doctor(args: argparse.Namespace) -> int:
     print(_status_line(f"{model_dir} ({len(checkpoints)} checkpoints)", bool(checkpoints)))
 
     return 1 if missing_core else 0
+
+
+def _run_assemble(args: argparse.Namespace) -> int:
+    _configure_logging(args.verbose)
+    try:
+        from .assemble import assemble_trex, generate_assembled
+        from .assemble.config import load_config
+
+        config = load_config(args.config)
+        structures = assemble_trex(
+            config.space,
+            constraints=config.constraints,
+            ligand_index=config.ligand_index(),
+            max_stoichiometries=(
+                args.max_stoichiometries
+                if args.max_stoichiometries is not None
+                else config.max_stoichiometries
+            ),
+            max_assignments_per_stoichiometry=(
+                args.max_assignments_per_stoichiometry
+                if args.max_assignments_per_stoichiometry is not None
+                else config.max_assignments_per_stoichiometry
+            ),
+        )
+        output = Path(args.output or config.output)
+        output.mkdir(parents=True, exist_ok=True)
+        topology_file = output / "assembled.trex"
+        topology_file.write_text(
+            "\n".join(item.trex for item in structures) + ("\n" if structures else ""),
+            encoding="utf-8",
+        )
+        print(f"Enumerated {len(structures)} unique canonical T-REX structures")
+        print(f"Wrote {topology_file}")
+        if args.enumerate_only:
+            return 0
+        optimizer = args.optimizer or config.optimizer
+        batch = generate_assembled(
+            structures,
+            output,
+            optimizer=optimizer,
+            overwrite=args.overwrite,
+            generator_kwargs=config.generator_kwargs,
+        )
+        print(f"Generated {batch.succeeded}; failed {batch.failed}")
+        print(f"Wrote {batch.manifest_path}")
+        return 1 if batch.failed else 0
+    except (KeyError, TypeError, ValueError, RuntimeError, OSError) as exc:
+        LOGGER.error("%s", exc)
+        return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -219,6 +269,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument("-v", "--verbose", action="count", default=0)
     generate.set_defaults(func=_run_generate)
+
+    assemble = subparsers.add_parser(
+        "assemble", help="enumerate a complex space and optionally generate all structures"
+    )
+    assemble.add_argument("config", help="YAML or JSON assembly configuration")
+    assemble.add_argument(
+        "--enumerate-only",
+        action="store_true",
+        help="write canonical T-REX structures without 3D generation",
+    )
+    assemble.add_argument("--output", help="override generation.output")
+    assemble.add_argument("--optimizer", choices=("xtb", "uma"), help="override generation.optimizer")
+    assemble.add_argument("--overwrite", action="store_true", help="regenerate completed candidates")
+    assemble.add_argument("--max-stoichiometries", type=_positive_int)
+    assemble.add_argument("--max-assignments-per-stoichiometry", type=_positive_int)
+    assemble.add_argument("-v", "--verbose", action="count", default=0)
+    assemble.set_defaults(func=_run_assemble)
 
     doctor = subparsers.add_parser("doctor", help="check dependencies and model checkpoints")
     doctor.add_argument("--model-dir", help="ensemble directory containing seed_*/best.pt")

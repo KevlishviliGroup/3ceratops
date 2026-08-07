@@ -1,0 +1,35 @@
+metal: Pd
+oxidation_state: 2
+spin: 0
+geometries:
+  - square_planar
+
+ligands:
+  - name: PPh3
+    identifier: pph3
+    min_count: 0
+    max_count: 2
+  - smiles: "[Cl-]"
+    identifier: chloride
+    min_count: 0
+    max_count: 2
+  - smiles: "[O-]C"
+    identifier: methoxide
+    min_count: 0
+    max_count: 2
+  - smiles: "[C-]#[O+]"
+    identifier: carbonyl
+    min_count: 0
+    max_count: 2
+
+limits:
+  max_stoichiometries: 100
+  max_assignments_per_stoichiometry: 1000
+
+generation:
+  output: assembled_pd
+  optimizer: xtb
+  options:
+    n_seeds: 10
+    top_k: 3
+    refine_gfn2: true

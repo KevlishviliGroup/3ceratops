@@ -324,6 +324,73 @@ geometry flags. The current mapping is:
 | T-shaped | `tsh` | - | 3 |
 | See-saw | `ssw` | - | 4 |
 
+## tmQMg ligand index
+
+The packaged ligand catalog stores observed canonical donor sites, haptic sites,
+intraligand trans pairs, binding-mode counts, and subset-based hemilability evidence.
+Trigonal-prismatic complexes are intentionally excluded.
+
+Input SMILES are canonicalized with the same T-REX/RDKit path used to build the
+catalog. The catalog records the RDKit version and lookup fails on a version mismatch,
+preventing silent changes to atom numbering.
+
+```python
+from trex_geo.assemble import BindingModeInput, LigandIndex
+
+index = LigandIndex()
+record = index.lookup("NCCN")
+
+# A missing ligand can be added to the user's override index. Site indices below
+# are 1-based positions in the supplied (not yet canonicalized) SMILES.
+record = index.resolve(
+    "PCCN",
+    if_missing=BindingModeInput(
+        sites=((1,), (4,)),
+        trans_pairs=(),
+        label="cis_bidentate",
+    ),
+)
+```
+
+The packaged catalog is never modified at runtime. User additions are written
+atomically to `~/.3ceratops/ligands.json`, or to the path set by
+`THREECERATOPS_LIGAND_OVERRIDES`.
+
+To rebuild the packaged catalog reproducibly:
+
+```bash
+python scripts/build_tmqmg_ligand_index.py \
+  Final_tmqmG_clean.csv trex_geo/data/tmqmg_ligand_index.json
+```
+
+## Stoichiometry assembly
+
+`assemble` first resolves each ligand against the catalog, then enumerates ligand
+counts and binding-mode multisets that exactly fill each requested coordination
+geometry. The default uses the most frequently observed binding mode; request
+`all_observed` to include lower-denticity or alternative modes.
+
+```python
+from trex_geo.assemble import AssemblySpace, LigandSpec, enumerate_stoichiometries
+
+space = AssemblySpace(
+    metal="Pd",
+    oxidation_state=2,
+    spin=0,
+    ligands=(
+        LigandSpec("NCCN", max_count=2),
+        LigandSpec("[Cl-]", max_count=4),
+    ),
+    geometries=("square_planar", "octahedral"),
+)
+
+candidates = enumerate_stoichiometries(space, max_candidates=500)
+```
+
+This stage returns structured stoichiometric candidates. It deliberately does
+not enumerate MAP isomers or generate coordinates; those are subsequent assembly
+stages. Trigonal-prismatic geometry is unsupported.
+
 ## Dependencies
 
 | Capability | Packages and resources |
@@ -382,6 +449,122 @@ Prediction was unavailable and 3CERATOPS used its documented fallback. Run
 `3ceratops doctor`, confirm that PyTorch and PyTorch Geometric are installed,
 and confirm that the model ensemble contains the expected checkpoints.
 
+
+## Assemble: enumerate complex topologies
+
+`trex_geo.assemble` enumerates exact coordination-number stoichiometries 
+of supplied ligands, all compatible T-REX MAP assignments, and then 
+canonicalizes and deduplicates the resulting full T-REX strings. 
+Some ligands can be inferred from common names by Ligand2SMILES installation; 
+all T-REX strings are assembled using SMILES.
+
+```python
+from trex_geo.assemble import (
+    AssemblyConstraints,
+    AssemblySpace,
+    LigandSpec,
+    SiteRef,
+    assemble_trex,
+)
+
+space = AssemblySpace(
+    metal="Pd",
+    oxidation_state=2,
+    spin=0,
+    ligands=(
+        LigandSpec("NCCN", max_count=1, min_count=1, identifier="en"),
+        LigandSpec("[Cl-]", max_count=2, min_count=2, identifier="chloride"),
+    ),
+    geometries=("square_planar",),
+)
+
+constraints = AssemblyConstraints(
+    required_trans=((
+        SiteRef("en", copy=0, atoms=(1,)),
+        SiteRef("chloride", copy=0, atoms=(1,)),
+    ),),
+)
+
+structures = assemble_trex(space, constraints=constraints)
+for structure in structures:
+    print(structure.trex)
+```
+
+Generate optimized 3D structures for every unique topology:
+
+```python
+from trex_geo.assemble import generate_assembled
+
+batch = generate_assembled(
+    structures,
+    "assembled_pd",
+    optimizer="xtb",
+    generator_kwargs={
+        "model_path": "/path/to/LF_GNN/ensemble_gram",
+        "n_seeds": 10,
+        "top_k": 3,
+        "refine_gfn2": True,
+    },
+)
+print(batch.succeeded, batch.failed, batch.manifest_path)
+```
+
+Each canonical T-REX string receives a readable T-REX-derived candidate
+directory plus a short stable hash. `manifest.json` records the topology, 
+geometry, stoichiometry, binding modes, optimizer, energy, internal-coordinate 
+source, diagnostics, and any failure. It is updated atomically after every 
+candidate. Rerunning skips successful candidates whose XYZ files remain and 
+retries failed or missing candidates; use `overwrite=True` to regenerate
+everything. One failed candidate does not stop the rest of the batch.
+
+`SiteRef.atoms` uses the same 1-based, ligand-local canonical-SMILES atom
+indices as T-REX `MapSite`. A multi-atom tuple is one haptic site. `copy` is
+zero-based within a `LigandSpec`; instantiated T-REX ligand positions remain
+1-based. Required-cis pairs are forbidden from appearing in a T-REX MAP pair.
+An intraligand required-trans pair must already belong to the selected indexed
+binding mode, so constraints cannot silently change cis/trans, fac/mer, or
+tetradentate ligand geometry.
+
+Trigonal-prismatic assembly is deliberately unsupported.
+
+### Assemble from the CLI
+
+The natural command runs enumeration and batch 3D generation:
+
+```bash
+3ceratops assemble examples/assemble.yaml
+```
+
+To inspect the canonical topology space first:
+
+```bash
+3ceratops assemble examples/assemble.yaml --enumerate-only
+```
+
+An example YAML file is provided in examplesJSON uses the same keys as YAML. 
+Each ligand supplies either `smiles` or an exact Ligand2SMILES `name`; 
+both are converted to canonical SMILES before index lookup. Constraint 
+atoms are 1-based canonical-SMILES atom indices, matching
+T-REX `MapSite`, while `copy` is zero-based within the named ligand spec.
+
+The CLI always writes `assembled.trex`, containing one canonical full T-REX
+string per line. A complete generation run also creates:
+
+```text
+assembled_pd/
+  assembled.trex
+  manifest.json
+  Pd_+2_LIGANDS_...__6d723a98/
+    structure.xyz
+    topology.trex
+    generation.json
+    work/
+```
+
+The candidate prefix is derived from the canonical T-REX string and sanitized
+for filesystem use. The short hash prevents collisions caused by sanitization
+or filename-length truncation. The complete canonical string is retained in
+`topology.trex`, the XYZ comment, and both manifests.
 
 ## Limitations
 

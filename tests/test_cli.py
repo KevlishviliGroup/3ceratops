@@ -57,3 +57,37 @@ def test_checkpoint_discovery(tmp_path):
     checkpoint.parent.mkdir()
     checkpoint.write_bytes(b"test")
     assert _find_checkpoints(tmp_path) == [checkpoint]
+
+
+def test_assemble_parser_accepts_operational_overrides():
+    from trex_geo.cli import build_parser
+
+    args = build_parser().parse_args([
+        "assemble", "space.yaml", "--enumerate-only", "--output", "results",
+        "--max-stoichiometries", "50", "--max-assignments-per-stoichiometry", "200",
+    ])
+    assert args.config == "space.yaml"
+    assert args.enumerate_only is True
+    assert args.max_stoichiometries == 50
+
+
+def test_assemble_cli_enumeration_only(monkeypatch, tmp_path, capsys):
+    from trex_geo import cli
+    from trex_geo.assemble import AssembledComplex
+    from trex_geo.assemble.config import AssembleConfig
+    from trex_geo.assemble.models import AssemblySpace, LigandSpec
+
+    config = AssembleConfig(AssemblySpace(
+        metal="Pd", oxidation_state=2,
+        ligands=(LigandSpec("[Cl-]", min_count=2, max_count=2),),
+        geometries=("linear",),
+    ), output=str(tmp_path))
+    monkeypatch.setattr("trex_geo.assemble.config.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "trex_geo.assemble.assemble_trex",
+        lambda *args, **kwargs: [AssembledComplex("canonical", "linear", (2,), (0, 0))],
+    )
+    args = cli.build_parser().parse_args(["assemble", "space.yaml", "--enumerate-only"])
+    assert args.func(args) == 0
+    assert (tmp_path / "assembled.trex").read_text() == "canonical\n"
+    assert "Enumerated 1" in capsys.readouterr().out

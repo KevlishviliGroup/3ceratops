@@ -89,7 +89,7 @@ include = ["trex_geo*", "LF_GNN"]
 namespaces = false
 
 [tool.setuptools.package-data]
-trex_geo = ["py.typed"]
+trex_geo = ["py.typed", "data/*.json"]
 LF_GNN = ["ensemble_gram/seed_*/best.pt"]
 
 [tool.black]
