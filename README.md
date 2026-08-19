@@ -246,7 +246,7 @@ The Python equivalent is `model_path="/path/to/ensemble_gram"`. A flat
 directory of `.pt` checkpoint files is also accepted.
 
 If prediction dependencies, checkpoints, or inference are unavailable, the
-top-level generation functions log the problem and fall back to idealized
+generation functions log the problem and fall back to idealized
 internals. Check `result.internals_source` or the XYZ comment line to confirm
 which source was used.
 
@@ -282,9 +282,9 @@ For each T-REX input, 3CERATOPS:
 6. ranks the candidates by energy and refines the lowest-energy subset; and
 7. returns or writes the best final structure.
 
-The current top-level pipelines rank candidates without T-REX round-trip
-validation because reconstruction is comparatively slow. For dataset generation,
-validate structures separately:
+The current pipeline ranks candidates without T-REX round-trip
+validation because reconstruction can be slow for select structures.
+For dataset generation, validate structures separately:
 
 ```python
 from trex_geo.multiseed_trex_validate import validate_trex_roundtrip
@@ -300,9 +300,10 @@ is_valid, reconstructed = validate_trex_roundtrip(
 ## Haptic sites
 
 The default `haptic_scale=0.35` contracts haptic ghost-site distances only
-during constrained embedding. This is an empirical placement aid, not a
-physical metal-centroid distance. The unscaled metal-centroid distance is used
-to construct haptic constraints during xTB or UMA relaxation.
+during constrained embedding. This is an empirical scale that worked best for 
+reconstruction, not a physical metal-centroid distance. The unscaled 
+metal-centroid distance is used to construct haptic constraints during 
+xTB or UMA relaxation.
 
 ## Supported geometry mappings
 
