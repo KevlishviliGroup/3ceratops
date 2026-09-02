@@ -357,8 +357,10 @@ def parse_ligand_smiles(smiles: str, add_hydrogens: bool = True) -> Optional[Lig
         # Sanitize (but don't adjust Hs yet)
         Chem.SanitizeMol(
             rd_mol, 
-            sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_ADJUSTHS
-        )
+            sanitizeOps=(Chem.SanitizeFlags.SANITIZE_ALL
+                         ^ Chem.SanitizeFlags.SANITIZE_ADJUSTHS
+                         ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+)
         
         # ADD HYDROGENS - critical step!
         if add_hydrogens:
