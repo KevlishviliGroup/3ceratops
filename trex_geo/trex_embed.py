@@ -36,6 +36,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDistGeom
 from rdkit.Geometry import Point3D
+from rdkit.DistanceGeometry import DoTriangleSmoothing
 
 # Import the LP solver
 try:
@@ -1235,6 +1236,79 @@ def _embed_level_2_etkdg(
     return None
 
 
+def _through_metal_pairs(rd_mol: Chem.Mol, metal_idx: int, pinned: set) -> List[Tuple[int, int]]:
+    """1-4 atom pairs whose shortest bond path runs through the metal (pinned-pinned pairs excluded)."""
+    topo = Chem.GetDistanceMatrix(rd_mol)
+    n = rd_mol.GetNumAtoms()
+    return [(i, j) for i in range(n) for j in range(i + 1, n)
+            if not (i in pinned and j in pinned) and i != metal_idx and j != metal_idx
+            and topo[i][j] == 3 and topo[i][metal_idx] + topo[metal_idx][j] == 3]
+
+
+def _through_metal_bounds(
+    rd_mol: Chem.Mol,
+    metal_idx: int,
+    cmap: Dict[int, Point3D],
+    lower_scale: float = 0.75,
+) -> np.ndarray:
+    """
+    RDKit bounds matrix with the through-metal 1-4 pairs freed.
+
+    The metal and donors are pinned by the coordMap, so their pairwise bounds
+    are already exact. Pairs such as H-N-M-X are not: RDKit derives their 1-4
+    bounds from a generic angle at the metal (no hybridization), giving one
+    window (about 3.3-4.2 A for H...X) whether X is cis or trans to that donor.
+    A trans arrangement with a long M-X target (e.g. 2.56 A for Pt-Br) needs
+    H...X near 5 A, and the summed violation fails FIRST_MINIMIZATION.
+    Here those pairs only keep a van der Waals lower bound; every other bound
+    is RDKit's, and coordMap pairs are fixed to their target distances.
+    """
+    bounds = rdDistGeom.GetMoleculeBoundsMatrix(rd_mol)
+    vdw = [get_vdw_radius(a.GetAtomicNum()) for a in rd_mol.GetAtoms()]
+    for i, j in _through_metal_pairs(rd_mol, metal_idx, set(cmap)):
+        bounds[i][j] = 100.0                            # upper bound
+        bounds[j][i] = lower_scale * (vdw[i] + vdw[j])  # lower bound
+    keys = sorted(cmap)
+    for a, i in enumerate(keys):
+        for j in keys[a + 1:]:
+            d = (cmap[i] - cmap[j]).Length()
+            bounds[i][j] = d + 0.01
+            bounds[j][i] = max(d - 0.01, 0.0)
+    DoTriangleSmoothing(bounds)
+    return bounds
+
+
+def _embed_level_3_through_metal(
+    rd_mol: Chem.Mol,
+    metal_idx: int,
+    cmap: Dict[int, Point3D],
+    seed: int,
+    max_attempts: int,
+) -> Optional[Chem.Mol]:
+    """
+    Level 3: same coordMap, through-metal 1-4 bounds freed (see _through_metal_bounds).
+    Only reached when levels 0-2 fail.
+    """
+    bounds = _through_metal_bounds(rd_mol, metal_idx, cmap)
+    for attempt in range(max_attempts):
+        params = rdDistGeom.EmbedParameters()
+        params.useRandomCoords = True
+        params.maxIterations = 500
+        params.useBasicKnowledge = True
+        params.ignoreSmoothingFailures = True
+        params.enforceChirality = False
+        params.SetBoundsMat(bounds)
+        params.SetCoordMap(cmap)
+        params.randomSeed = seed + attempt * 24680
+        mol_copy = Chem.RWMol(Chem.Mol(rd_mol))
+        try:
+            if AllChem.EmbedMolecule(mol_copy, params) == 0 and mol_copy.GetNumConformers() > 0:
+                return mol_copy.GetMol()
+        except Exception as e:
+            logger.debug(f"Level 3 attempt {attempt + 1} failed: {e}")
+    return None
+
+
 def constrained_embed(
     rd_mol: Chem.Mol,
     metal_idx: int,
@@ -1244,7 +1318,7 @@ def constrained_embed(
     scale: float = 1.0,
     max_attempts: int = 30,
     seed: int = None,
-    max_relaxation_level: int = 2,
+    max_relaxation_level: int = 3,
     reject_severe_clashes: bool = True,
 ) -> Tuple[Optional[Chem.Mol], int, str, Optional[ClashResult]]:
     """
@@ -1273,6 +1347,12 @@ def constrained_embed(
         ligand conformations, especially for rings and conjugated systems.
         Best for complexes with rigid or semi-rigid ligands.
     
+    Level 3 - Through-metal bounds freed:
+        Keeps every RDKit bound except the 1-4 pairs whose shortest path runs
+        through the metal (e.g. H-N-M-X), which RDKit derives from a generic
+        angle at the metal. Rescues cases such as cis-[MX2(NH3)2], X = Br, I,
+        where levels 0-2 fail at FIRST_MINIMIZATION on every attempt.
+    
     Args:
         rd_mol: RDKit molecule with dummy metal
         metal_idx: Index of metal (dummy) atom
@@ -1282,7 +1362,7 @@ def constrained_embed(
         scale: Unused, kept for backward compatibility  
         max_attempts: Total attempts distributed across levels
         seed: Base random seed (default 42)
-        max_relaxation_level: Maximum level to try (0-2, default 2)
+        max_relaxation_level: Maximum level to try (0-3, default 3)
         reject_severe_clashes: If True, reject structures with severe atom
             clashes (< 0.5 × sum of VDW radii) and try next level
         
@@ -1327,6 +1407,8 @@ def constrained_embed(
          lambda: _embed_level_1_relaxed(rd_mol, cmap, seed, attempts_per_level)),
         (2, "etkdg_v3",
          lambda: _embed_level_2_etkdg(rd_mol, cmap, seed, attempts_per_level)),
+        (3, "through_metal_bounds",
+         lambda: _embed_level_3_through_metal(rd_mol, metal_idx, cmap, seed, attempts_per_level)),
     ]
     
     for level, level_name, embed_func in levels:
@@ -1767,7 +1849,7 @@ def embed_trex_metallogen(
     max_attempts: int = 30,
     seed: int = None,
     geometry: str = None,
-    max_relaxation_level: int = 2,
+    max_relaxation_level: int = 3,
     reject_severe_clashes: bool = True,
 ) -> EmbedResult:
     """
@@ -1779,10 +1861,11 @@ def embed_trex_metallogen(
         max_attempts: Number of embedding attempts (distributed across levels)
         seed: Random seed for embedding (if None, uses default)
         geometry: Geometry name like "6_octahedral" (if None, inferred from t.G)
-        max_relaxation_level: Maximum relaxation level to try (0-2, default 2)
+        max_relaxation_level: Maximum relaxation level to try (0-3, default 3)
             - 0: Strict constrained (original MetalloGen behavior)
             - 1: Relaxed params (more iterations, useBasicKnowledge=True)
             - 2: ETKDG v3 with experimental torsion angle preferences
+            - 3: Through-metal 1-4 bounds freed (see _through_metal_bounds)
         reject_severe_clashes: Reject structures with severe atom clashes
         
     Returns:
