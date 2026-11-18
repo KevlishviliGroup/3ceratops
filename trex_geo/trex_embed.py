@@ -666,6 +666,7 @@ def _run_lp_solver(
     adj_matrix: np.ndarray,
     total_charge: int,
     metal_idx: int,
+    free_charge: bool = False,
 ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Helper function to run LP solver and return results.
@@ -684,6 +685,7 @@ def _run_lp_solver(
             cleanUp=True,
             HalogenConstraint=True,
             MetalCenters=[metal_idx],
+            FreeCharge=free_charge,
         )
         return chg_list, bo_matrix
     except Exception as e:
@@ -792,14 +794,30 @@ def get_valid_molecule(
         new_atom_list.append(new_atom)
     
     # =========================================================================
-    # FIRST ATTEMPT: Try LP solver with standard replacements (original behavior)
+    # FIRST ATTEMPT: LP with the total charge left free
     # =========================================================================
-    logger.info("Calling LP solver for bond order assignment...")
-    
-    chg_list, bo_matrix = _run_lp_solver(new_atom_list, adj_matrix, total_charge, metal_idx)
+    # The LP sees a covalent surrogate: the metal is a main-group dummy chosen by
+    # coordination number (CN 4 -> Si, CN 6 -> S, CN 2 -> O) and every dative bond
+    # is an ordinary covalent bond. Its natural charge is therefore not the
+    # complex charge: [PtCl4]2- becomes SiCl4 (0), [Pt(NH3)4]2+ becomes
+    # Si(NH3+)4 (+4). A four-bonded Si or two-bonded O dummy cannot carry charge
+    # and a bonded halide cannot be negative, so constraining the total to the
+    # complex charge is infeasible for halide/ammine-only CN 2 and CN 4 complexes,
+    # and for cyanides it can force C#N into C=N(-) to place the charge. The LP
+    # charges are discarded anyway (build_rdkit_mol sets them to 0), so leave the
+    # total free and let the LP pick the most neutral closed-shell assignment.
+    logger.info("Calling LP solver for bond order assignment (free total charge)...")
+
+    chg_list, bo_matrix = _run_lp_solver(new_atom_list, adj_matrix, total_charge, metal_idx,
+                                         free_charge=True)
     
     if bo_matrix is not None and chg_list is not None:
-        logger.info(f"LP solver succeeded on first attempt: charges sum = {np.sum(chg_list)}")
+        logger.info(f"LP solver succeeded with free total charge: surrogate charge = {np.sum(chg_list)}")
+    else:
+        logger.info("Free-charge LP failed, retrying with the complex charge...")
+        chg_list, bo_matrix = _run_lp_solver(new_atom_list, adj_matrix, total_charge, metal_idx)
+        if bo_matrix is not None and chg_list is not None:
+            logger.info(f"LP solver succeeded on first attempt: charges sum = {np.sum(chg_list)}")
     
     # =========================================================================
     # FALLBACK: If first attempt failed, try with LP donor shifts
@@ -1106,6 +1124,7 @@ def _embed_level_0_strict(
     cmap: Dict[int, Point3D],
     seed: int,
     max_attempts: int,
+    bounds: Optional[np.ndarray] = None,
 ) -> Optional[Chem.Mol]:
     """
     Level 0: Original strict constrained embedding (MetalloGen behavior).
@@ -1130,6 +1149,8 @@ def _embed_level_0_strict(
     params.useBasicKnowledge = False
     params.ignoreSmoothingFailures = True
     params.SetCoordMap(cmap)
+    if bounds is not None:
+        params.SetBoundsMat(bounds)
     
     for attempt in range(max_attempts):
         params.randomSeed = seed + attempt * 12345
@@ -1147,6 +1168,7 @@ def _embed_level_1_relaxed(
     cmap: Dict[int, Point3D],
     seed: int,
     max_attempts: int,
+    bounds: Optional[np.ndarray] = None,
 ) -> Optional[Chem.Mol]:
     """
     Level 1: Relaxed parameters - more iterations and basic knowledge.
@@ -1173,6 +1195,8 @@ def _embed_level_1_relaxed(
     params.ignoreSmoothingFailures = True
     params.enforceChirality = False
     params.SetCoordMap(cmap)
+    if bounds is not None:
+        params.SetBoundsMat(bounds)
     
     for attempt in range(max_attempts):
         params.randomSeed = seed + attempt * 54321
@@ -1190,6 +1214,7 @@ def _embed_level_2_etkdg(
     cmap: Dict[int, Point3D],
     seed: int,
     max_attempts: int,
+    bounds: Optional[np.ndarray] = None,
 ) -> Optional[Chem.Mol]:
     """
     Level 2: ETKDG v3 with experimental torsion angle knowledge.
@@ -1224,6 +1249,8 @@ def _embed_level_2_etkdg(
     params.maxIterations = 500
     params.ignoreSmoothingFailures = True
     params.SetCoordMap(cmap)
+    if bounds is not None:
+        params.SetBoundsMat(bounds)
     
     for attempt in range(max_attempts):
         params.randomSeed = seed + attempt * 13579
@@ -1237,12 +1264,160 @@ def _embed_level_2_etkdg(
 
 
 def _through_metal_pairs(rd_mol: Chem.Mol, metal_idx: int, pinned: set) -> List[Tuple[int, int]]:
-    """1-4 atom pairs whose shortest bond path runs through the metal (pinned-pinned pairs excluded)."""
+    """
+    Atom pairs (1-4 and beyond) whose shortest bond path runs through the metal,
+    excluding pairs where both atoms are pinned by the coordMap. RDKit derives
+    their bounds from a generic angle at the metal; 1-5 pairs matter for linear
+    ligands, e.g. N...N' in trans N#C-M-C#N, which RDKit caps at ~5.5 A.
+    """
     topo = Chem.GetDistanceMatrix(rd_mol)
     n = rd_mol.GetNumAtoms()
     return [(i, j) for i in range(n) for j in range(i + 1, n)
             if not (i in pinned and j in pinned) and i != metal_idx and j != metal_idx
-            and topo[i][j] == 3 and topo[i][metal_idx] + topo[metal_idx][j] == 3]
+            and topo[i][j] >= 3 and topo[i][metal_idx] + topo[metal_idx][j] == topo[i][j]]
+
+
+def _linear_donors(rd_mol: Chem.Mol, metal_idx: int, cmap: Dict[int, Point3D]) -> List[int]:
+    """
+    Donor atoms whose ligand continues in a straight line away from the metal:
+    sp donors (cyanide, CO, nitriles, isocyanides, acetylides) and N-bound
+    cumulated ligands whose only neighbor is an sp carbon (N=C=S, N=C=O).
+    Azide is left out on purpose: M-N-N is bent (about 120-130 deg).
+    """
+    linear = []
+    for d in cmap:
+        if d == metal_idx:
+            continue
+        atom = rd_mol.GetAtomWithIdx(d)
+        others = [n for n in atom.GetNeighbors() if n.GetIdx() != metal_idx]
+        if atom.GetHybridization() == Chem.HybridizationType.SP:
+            linear.append(d)
+        elif (len(others) == 1 and others[0].GetIdx() not in cmap
+              and others[0].GetAtomicNum() == 6
+              and others[0].GetHybridization() == Chem.HybridizationType.SP
+              and rd_mol.GetBondBetweenAtoms(d, others[0].GetIdx()).GetBondTypeAsDouble() >= 2):
+            linear.append(d)
+    return linear
+
+
+def _fix_linear_donor_bounds(
+    bounds: np.ndarray,
+    rd_mol: Chem.Mol,
+    metal_idx: int,
+    cmap: Dict[int, Point3D],
+    linear: List[int],
+    min_angle_deg: float = 165.0,
+) -> None:
+    """
+    Set M...X bounds (X bonded to a linear donor D) from the target M-D distance.
+
+    RDKit derives the 1-3 M...X bound from its own M-D bond length, which is
+    shorter than the coordMap distance; a linear M-D-X then cannot fit and the
+    ligand is bent (cyanides at 80-125 deg) or embedding fails outright
+    ([Fe(CN)6]4-, [Ni(CO)4]). Here M...X = r(M-D) + r(D-X) for a straight
+    ligand, allowing angles down to min_angle_deg.
+    """
+    cos_min = np.cos(np.radians(min_angle_deg))
+    for d in linear:
+        r = (cmap[d] - cmap[metal_idx]).Length()
+        for nb in rd_mol.GetAtomWithIdx(d).GetNeighbors():
+            x = nb.GetIdx()
+            if x == metal_idx or x in cmap:
+                continue
+            b = 0.5 * (bounds[min(d, x)][max(d, x)] + bounds[max(d, x)][min(d, x)])
+            hi = r + b
+            lo = np.sqrt(r * r + b * b - 2 * r * b * cos_min)
+            i, j = min(metal_idx, x), max(metal_idx, x)
+            bounds[i][j] = hi + 0.02   # upper bound
+            bounds[j][i] = lo - 0.02   # lower bound
+
+
+def _straighten_linear_ligands(
+    mol: Chem.Mol,
+    metal_idx: int,
+    linear: List[int],
+    clash_scale: float = 0.75,
+    residual_deg: float = 2.0,
+) -> Tuple[Chem.Mol, int]:
+    """
+    Rotate each monodentate linear ligand rigidly about its donor so that
+    M-D-X comes to within residual_deg of 180 deg.
+
+    The bounds from _fix_linear_donor_bounds allow 165-180 deg, but the loose
+    minimization at the early levels typically stops at 140-165 deg. Exactly
+    180 deg is avoided on purpose: GFN-FF returns NaN forces for a perfectly
+    linear angle, which breaks the downstream optimization. Donor positions
+    are unchanged. A rotation is skipped if the ligand is chelating
+    or if it would create a contact shorter than clash_scale x (sum of vdW
+    radii) that was not already there.
+
+    Returns (mol, number of ligands straightened).
+    """
+    if not linear or mol is None or mol.GetNumConformers() == 0:
+        return mol, 0
+    out = Chem.Mol(mol)
+    conf = out.GetConformer()
+    X = np.array(conf.GetPositions())
+    n = out.GetNumAtoms()
+    vdw = np.array([get_vdw_radius(a.GetAtomicNum()) for a in out.GetAtoms()])
+    donors = {nb.GetIdx() for nb in out.GetAtomWithIdx(metal_idx).GetNeighbors()}
+
+    # ligand fragments with the metal removed
+    adj = {i: [nb.GetIdx() for nb in out.GetAtomWithIdx(i).GetNeighbors() if nb.GetIdx() != metal_idx]
+           for i in range(n) if i != metal_idx}
+
+    def fragment(start):
+        seen, stack = {start}, [start]
+        while stack:
+            for j in adj[stack.pop()]:
+                if j not in seen:
+                    seen.add(j)
+                    stack.append(j)
+        return seen
+
+    def min_contact(Y, moved):
+        rest = [k for k in range(n) if k not in moved]
+        A, B = np.array(sorted(moved)), np.array(rest)
+        d = np.linalg.norm(Y[A][:, None, :] - Y[B][None, :, :], axis=-1)
+        bonded = np.array([[out.GetBondBetweenAtoms(int(a), int(b)) is not None for b in B] for a in A])
+        ratio = np.where(bonded, np.inf, d / (vdw[A][:, None] + vdw[B][None, :]))
+        return float(ratio.min()) if ratio.size else np.inf
+
+    count = 0
+    for d in linear:
+        others = adj.get(d, [])
+        if len(others) != 1:
+            continue
+        frag = fragment(d)
+        if len(frag & donors) > 1:
+            continue  # chelate: a rigid rotation would move another donor
+        v = X[d] - X[metal_idx]
+        u = X[others[0]] - X[d]
+        if np.linalg.norm(v) < 1e-6 or np.linalg.norm(u) < 1e-6:
+            continue
+        v, u = v / np.linalg.norm(v), u / np.linalg.norm(u)
+        c = float(np.clip(u @ v, -1.0, 1.0))
+        theta = np.arccos(c) - np.radians(residual_deg)
+        if theta <= 0:
+            continue  # already within residual_deg of linear
+        axis = np.cross(u, v)
+        if np.linalg.norm(axis) < 1e-8:  # u antiparallel to v: any perpendicular axis
+            axis = np.cross(u, [1.0, 0.0, 0.0] if abs(u[0]) < 0.9 else [0.0, 1.0, 0.0])
+        axis /= np.linalg.norm(axis)
+        K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        R = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+        moved = sorted(frag - {d})
+        Y = X.copy()
+        Y[moved] = (X[moved] - X[d]) @ R.T + X[d]
+        before, after = min_contact(X, frag), min_contact(Y, frag)
+        if after < clash_scale and after < before:
+            logger.debug(f"Not straightening ligand at donor {d}: new contact ({after:.2f} x vdW)")
+            continue
+        X = Y
+        count += 1
+    for i in range(n):
+        conf.SetAtomPosition(i, Point3D(*X[i]))
+    return out, count
 
 
 def _through_metal_bounds(
@@ -1250,9 +1425,11 @@ def _through_metal_bounds(
     metal_idx: int,
     cmap: Dict[int, Point3D],
     lower_scale: float = 0.75,
+    linear: Optional[List[int]] = None,
 ) -> np.ndarray:
     """
-    RDKit bounds matrix with the through-metal 1-4 pairs freed.
+    RDKit bounds matrix with the through-metal pairs freed (and, for linear
+    donors, M...X set for a straight M-D-X; see _fix_linear_donor_bounds).
 
     The metal and donors are pinned by the coordMap, so their pairwise bounds
     are already exact. Pairs such as H-N-M-X are not: RDKit derives their 1-4
@@ -1268,6 +1445,10 @@ def _through_metal_bounds(
     for i, j in _through_metal_pairs(rd_mol, metal_idx, set(cmap)):
         bounds[i][j] = 100.0                            # upper bound
         bounds[j][i] = lower_scale * (vdw[i] + vdw[j])  # lower bound
+    if linear is None:
+        linear = _linear_donors(rd_mol, metal_idx, cmap)
+    if linear:
+        _fix_linear_donor_bounds(bounds, rd_mol, metal_idx, cmap, linear)
     keys = sorted(cmap)
     for a, i in enumerate(keys):
         for j in keys[a + 1:]:
@@ -1348,9 +1529,9 @@ def constrained_embed(
         Best for complexes with rigid or semi-rigid ligands.
     
     Level 3 - Through-metal bounds freed:
-        Keeps every RDKit bound except the 1-4 pairs whose shortest path runs
-        through the metal (e.g. H-N-M-X), which RDKit derives from a generic
-        angle at the metal. Rescues cases such as cis-[MX2(NH3)2], X = Br, I,
+        Keeps every RDKit bound except pairs whose shortest path runs through
+        the metal (e.g. H-N-M-X), which RDKit derives from a generic angle at
+        the metal. Rescues cases such as cis-[MX2(NH3)2], X = Br, I,
         where levels 0-2 fail at FIRST_MINIMIZATION on every attempt.
     
     Args:
@@ -1400,13 +1581,20 @@ def constrained_embed(
     # Distribute attempts across levels (3 levels now)
     attempts_per_level = max(max_attempts // 3, 5)
     
+    # Linear donors (CN-, CO, NCS-, nitriles): RDKit's own bounds bend them or make
+    # the embedding infeasible, so every level gets metal-aware bounds instead.
+    linear = _linear_donors(rd_mol, metal_idx, cmap)
+    pre_bounds = _through_metal_bounds(rd_mol, metal_idx, cmap, linear=linear) if linear else None
+    if linear:
+        logger.debug(f"Linear donors {linear}: using metal-aware bounds at every level")
+
     levels = [
         (0, "strict_constrained", 
-         lambda: _embed_level_0_strict(rd_mol, cmap, seed, attempts_per_level)),
+         lambda: _embed_level_0_strict(rd_mol, cmap, seed, attempts_per_level, pre_bounds)),
         (1, "relaxed_params",
-         lambda: _embed_level_1_relaxed(rd_mol, cmap, seed, attempts_per_level)),
+         lambda: _embed_level_1_relaxed(rd_mol, cmap, seed, attempts_per_level, pre_bounds)),
         (2, "etkdg_v3",
-         lambda: _embed_level_2_etkdg(rd_mol, cmap, seed, attempts_per_level)),
+         lambda: _embed_level_2_etkdg(rd_mol, cmap, seed, attempts_per_level, pre_bounds)),
         (3, "through_metal_bounds",
          lambda: _embed_level_3_through_metal(rd_mol, metal_idx, cmap, seed, attempts_per_level)),
     ]
@@ -1419,6 +1607,10 @@ def constrained_embed(
         mol = embed_func()
         
         if mol is not None:
+            if linear:
+                mol, n_straight = _straighten_linear_ligands(mol, metal_idx, linear)
+                if n_straight:
+                    logger.debug(f"Straightened {n_straight} linear ligand(s)")
             clash_result = check_atom_clashes(mol)
             
             if reject_severe_clashes and clash_result.has_severe_clash:
@@ -2003,7 +2195,24 @@ def embed_trex_metallogen(
         )
     
     diagnostics['rdkit_atoms'] = rd_mol.GetNumAtoms()
-    
+
+    # A site on top of the metal means the requested angles could not be realized in 3D
+    # (e.g. five singles that all ask for 90 deg); the Gram projection then shrinks one
+    # site to the origin. Embedding around it returns a donor sitting on the metal.
+    site_norms = np.linalg.norm(np.asarray(site_coords, dtype=float).reshape(n_sites, 3), axis=1)
+    collapsed = [i + 1 for i, r in enumerate(site_norms) if r < 0.3]
+    if collapsed:
+        logger.error(f"Coordination sphere has site(s) {collapsed} at the metal; not embedding")
+        diagnostics['collapsed_sites'] = collapsed
+        diagnostics['embedding_level_name'] = "collapsed_site"
+        return EmbedResult(
+            mol=None, success=False, metal_idx=0,
+            coord_atom_indices=[], charge=total_charge, spin=t.spin or 1,
+            diagnostics=diagnostics,
+            embedding_level=-1,
+            embedding_level_name="collapsed_site",
+        )
+
     # Constrained embedding with progressive relaxation
     logger.info("Step 5: Constrained embedding (with progressive relaxation)...")
     

@@ -74,6 +74,36 @@ GEO_CODE_TO_FULL = {
 }
 
 
+# trex.geometry's ideal-angle table is keyed by T-REX's own codes ('thd', 'trbp', ...),
+# but a hand-written G field may carry the short codes that 3ceratops also accepts
+# ('T', 'TBP', ...). Unknown keys fall back to 90 degrees there, which for G:T puts the
+# four donors mutually perpendicular (one of them lands on the metal) and for G:TBP gives
+# 90 degree equatorial angles. Each short code is mapped only at its own coordination
+# number: canonical T-REX uses G:TP for trigonal prismatic (CN 6), which must not be
+# read as trigonal planar.
+GEO_CODE_TO_TREX = {
+    # code: (T-REX code, coordination number)
+    'SP': ('sqpl', 4),
+    'SQP': ('sqpy', 5),
+    'T': ('thd', 4),
+    'TBP': ('trbp', 5),
+    'L': ('ln', 2),
+    'TP': ('trpl', 3),
+    'TPY': ('thd', 3),  # trigonal pyramid = tetrahedron with one vacant site
+    'B': ('bnt', 2),
+    'BNT': ('bnt', 2),
+}
+
+
+def get_trex_geometry_code(t: TrexFull) -> str:
+    """Geometry code in the form trex.geometry expects ('thd', 'trbp', ...)."""
+    code = t.get_geo_type()
+    mapped = GEO_CODE_TO_TREX.get(code)
+    if mapped is not None and 2 * len(t.pairs) + len(t.singles) == mapped[1]:
+        return mapped[0]
+    return code
+
+
 def get_geometry_full_name(t: TrexFull) -> str:
     """Get full geometry name like '6_octahedral' from TrexFull."""
     # Use get_geo_type() which handles G field and inference
@@ -205,7 +235,7 @@ def compute_idealized_internals(t: TrexFull) -> dict:
     trans_cos = [IDEAL_TRANS_COS] * n_trans_pairs
     
     # Cis angles: geometry-dependent
-    geometry = t.get_geo_type()
+    geometry = get_trex_geometry_code(t)
     n_pair_sites = 2 * n_trans_pairs
     n_singles = len(t.singles)
     

@@ -387,6 +387,13 @@ def maximize_bo(
         # the number of lone pair should not be negative
         prob += lp_constr <= group_list[i], f"lp_{i}"
 
+        # FreeCharge: without the total-charge constraint, bond-order maximization can
+        # buy extra bonds with charge (e.g. an eta2-peroxide becoming O#O with +2 on
+        # each O). Keep second-row atoms within -2..+1.
+        if kwargs.get("FreeCharge", False) and period_list[i] == 2 and i not in M_list:
+            prob += t1[2 * i] - t1[2 * i + 1] <= 1, f"fc_max_{i}"
+            prob += t1[2 * i] - t1[2 * i + 1] >= -2, f"fc_min_{i}"
+
         # octet rule
         # octet distance
         if period_list[i] == 1:
@@ -410,7 +417,8 @@ def maximize_bo(
                     )
                 prob += ring_constr <= 1, f"ring_{i}_{n}"
 
-    prob += chg_constr == chg_mol, "chg_consv"
+    if not kwargs.get("FreeCharge", False):
+        prob += chg_constr == chg_mol, "chg_consv"
 
     od_priority = 1  # octet distance priority
     bo_priority = 2  # bond order maximization priority
@@ -581,6 +589,13 @@ def resolve_chg(
         # the number of lone pair should not be negative
         prob += lp_constr <= group_list[i], f"lp_{i}"
 
+        # FreeCharge: without the total-charge constraint, bond-order maximization can
+        # buy extra bonds with charge (e.g. an eta2-peroxide becoming O#O with +2 on
+        # each O). Keep second-row atoms within -2..+1.
+        if kwargs.get("FreeCharge", False) and period_list[i] == 2 and i not in M_list:
+            prob += t1[2 * i] - t1[2 * i + 1] <= 1, f"fc_max_{i}"
+            prob += t1[2 * i] - t1[2 * i + 1] >= -2, f"fc_min_{i}"
+
         # octet rule
         # if charged and period > 2, apply expanded octet rule
         # else, freeze the valence (octet rule)
@@ -607,6 +622,7 @@ def resolve_chg(
                     )
                 prob += ring_constr <= 1, f"ring_{i}_{n}"
 
+    # always conserved here: with FreeCharge, chg_mol is the total found by maximize_bo
     prob += chg_constr == chg_mol, "chg_consv"
 
     ### optimization
@@ -675,7 +691,8 @@ def compute_chg_and_bo_debug(molecule, chg_mol, resolve=True, cleanUp=True, **kw
     ) = get_lists(molecule)
 
     atom_num, bond_num = len(z_list), len(bond_list)
-    eIsEven = int(np.sum(z_list) - chg_mol) % 2 == 0
+    # FreeCharge: the total charge is not constrained, so require a closed-shell assignment
+    eIsEven = True if kwargs.get("FreeCharge", False) else int(np.sum(z_list) - chg_mol) % 2 == 0
     resolve_step = 0
     kwargs["cleanUp"] = cleanUp
 
@@ -720,6 +737,9 @@ def compute_chg_and_bo_debug(molecule, chg_mol, resolve=True, cleanUp=True, **kw
         # 1. period > 2
         # 2. non-zero charge on itself
         overcharged = (period_list > 2) & (np.abs(chg_list0) != 0)
+        # FreeCharge leaves the total open in maximize_bo only; resolve_chg moves charge
+        # around at fixed total, so it keeps the total maximize_bo settled on
+        resolve_total = int(np.sum(chg_list0)) if kwargs.get("FreeCharge", False) else chg_mol
         print("Debug: overcharged", np.nonzero(overcharged))
 
         chg_list1, bo_dict1, raw_outputs1 = resolve_chg(
@@ -732,7 +752,7 @@ def compute_chg_and_bo_debug(molecule, chg_mol, resolve=True, cleanUp=True, **kw
             neighbor_list,
             en_list,
             ring_neighbors_info,
-            chg_mol,
+            resolve_total,
             eIsEven,
             overcharged,
             raw_outputs[0],
@@ -787,7 +807,8 @@ def compute_chg_and_bo(
     ) = get_lists(molecule)
 
     atom_num, bond_num = len(z_list), len(bond_list)
-    eIsEven = int(np.sum(z_list) - chg_mol) % 2 == 0
+    # FreeCharge: the total charge is not constrained, so require a closed-shell assignment
+    eIsEven = True if kwargs.get("FreeCharge", False) else int(np.sum(z_list) - chg_mol) % 2 == 0
     resolve_step = 0
     kwargs["cleanUp"] = cleanUp
 
@@ -824,6 +845,9 @@ def compute_chg_and_bo(
         # 1. period > 2
         # 2. non-zero charge on itself
         overcharged = (period_list > 2) & (np.abs(chg_list) != 0)
+        # FreeCharge leaves the total open in maximize_bo only; resolve_chg moves charge
+        # around at fixed total, so it keeps the total maximize_bo settled on
+        resolve_total = int(np.sum(chg_list)) if kwargs.get("FreeCharge", False) else chg_mol
 
         chg_list, bo_dict, raw_outputs2 = resolve_chg(
             atom_num,
@@ -835,7 +859,7 @@ def compute_chg_and_bo(
             neighbor_list,
             en_list,
             ring_neighbors_info,
-            chg_mol,
+            resolve_total,
             eIsEven,
             overcharged,
             raw_outputs[0],
