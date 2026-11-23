@@ -193,6 +193,7 @@ class BuildConfig:
     include_metal_dative: bool = False
     include_site_hyperedges: bool = True
     include_all_site_hyperedges: bool = True  # all M-L 1-body terms, not just haptic
+    include_pair_path: bool = False  # he_path_class on every hyperedge (PAIR_PATH_* classes)
 
 
 def atom_feature(rd_atom: Chem.Atom, is_metal: bool = False, metal_chirality: float = 0.0) -> np.ndarray:
@@ -242,6 +243,30 @@ ANGLE_COS_VALUES = [
 ]
 ANGLE_CLASS_NONE = 6
 NUM_ANGLE_CLASSES = 7
+
+
+# Pair hyperedges: are the two sites on the same ligand, and how far apart are they
+# through it? Message passing gives equivalent donors of identical ligands identical
+# embeddings, so without this a chelate bite and an angle between two ligands are the
+# same input (e.g. the two O-Zn-S bites and the two inter-ligand O-Zn-S of ZnL2 with an
+# O,S chelate get one prediction).
+#   0: different ligands
+#   1-4: same ligand, chelate ring of <= 4, 5, 6, 7 atoms
+#        (ring size = bonds between the two donors + 2; an eta-n site is one site, so
+#        two separate sites on adjacent atoms, a 3-membered ring, does not occur)
+#   5: same ligand, ring of 8 or more (macrocycles, ansa bridges, long linkers)
+#   6: not a pair (site hyperedge)
+PAIR_PATH_DIFFERENT_LIGANDS = 0
+PAIR_PATH_SITE = 6
+NUM_PAIR_PATH_CLASSES = 7
+
+
+def pair_path_class(n_bonds: float) -> int:
+    """Class for two sites on the same ligand whose closest atoms are n_bonds apart."""
+    ring = n_bonds + 2
+    if ring <= 4: return 1
+    if ring >= 8: return 5
+    return int(ring) - 3
 
 
 def cos_to_angle_class(cos_val: float) -> int:
@@ -385,6 +410,16 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
     s_atoms = [atoms for (_, atoms) in collected]
     nS = len(sites)
 
+    he_path_class: List[int] = []
+    if cfg.include_pair_path:
+        # topological distances in the ligands' own bond graph (no metal bonds)
+        lig_only = Chem.RWMol(mol)
+        for b in list(lig_only.GetBonds()):
+            i_, j_ = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+            if i_ == metal_idx or j_ == metal_idx or b.GetBondType() == Chem.BondType.ZERO:
+                lig_only.RemoveBond(i_, j_)
+        topo = Chem.GetDistanceMatrix(lig_only.GetMol())
+
     for i in range(nS):
         for j in range(i + 1, nS):
             Si, Sj = sites[i], sites[j]
@@ -395,6 +430,12 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
             
             ideal_cos = _compute_ideal_cos_for_pair(T, Si, Sj, is_trans)
             he_angle_class.append(cos_to_angle_class(ideal_cos))
+            if cfg.include_pair_path:
+                if Si.lig != Sj.lig:
+                    he_path_class.append(PAIR_PATH_DIFFERENT_LIGANDS)
+                else:
+                    d_ij = min(topo[a][b] for a in s_atoms[i] for b in s_atoms[j])
+                    he_path_class.append(pair_path_class(d_ij) if d_ij < 1e6 else 5)
             
             for gid in s_atoms[i]: he_node.append(gid); he_id.append(hid); he_role.append(0)
             he_node.append(metal_idx); he_id.append(hid); he_role.append(1)
@@ -406,6 +447,8 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
                 hid = len(he_type)
                 he_type.append(2)
                 he_angle_class.append(ANGLE_CLASS_NONE)
+                if cfg.include_pair_path:
+                    he_path_class.append(PAIR_PATH_SITE)
                 he_node.append(metal_idx); he_id.append(hid); he_role.append(1)
                 for gid in atoms: he_node.append(gid); he_id.append(hid); he_role.append(0)
 
@@ -448,6 +491,9 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
     )
     data.he_role = he_role_t
     data.he_ideal = he_ideal_t
+    if cfg.include_pair_path:
+        data.he_path_class = (torch.tensor(he_path_class, dtype=torch.long)
+                              if he_path_class else torch.zeros((0,), dtype=torch.long))
 
 
     os_val = int(getattr(T, 'ox', 0))
@@ -468,11 +514,15 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
 # ============================================================
 
 class HyperCardinalDirectional(nn.Module):
-    def __init__(self, d: int, num_types: int = 3, num_angle_classes: int = NUM_ANGLE_CLASSES):
+    def __init__(self, d: int, num_types: int = 3, num_angle_classes: int = NUM_ANGLE_CLASSES,
+                 num_path_classes: int = 0):
         super().__init__()
         self.d = d
         self.type_emb = nn.Embedding(num_types, d)
         self.angle_emb = nn.Embedding(num_angle_classes, d)
+        # 0 keeps the layer (and old checkpoints) exactly as before
+        self.num_path_classes = num_path_classes
+        self.path_emb = nn.Embedding(num_path_classes, d) if num_path_classes > 0 else None
         
         self.enc = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d))
         self.scM = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, 1))
@@ -507,7 +557,7 @@ class HyperCardinalDirectional(nn.Module):
         num.index_add_(0, hed_idx, feats_f32 * weights.unsqueeze(-1))
         return (num / sum_w.unsqueeze(-1)).to(x.dtype)  # Cast back to original dtype
 
-    def forward(self, x, he_index, he_type, he_role, he_angle_class=None, H_prev=None):
+    def forward(self, x, he_index, he_type, he_role, he_angle_class=None, H_prev=None, he_path_class=None):
         if he_index.numel() == 0 or he_type.numel() == 0:
             return (x, torch.zeros((0, x.size(1)), device=x.device)) if H_prev is None else (x, H_prev)
         
@@ -520,6 +570,9 @@ class HyperCardinalDirectional(nn.Module):
         b_bar = self._attn_pool_role(x, node_ids, he_ids, rB, H, d, dev, self.scSite) 
 
         t = self.type_emb(torch.clamp(he_type, max=2))
+        if self.path_emb is not None and he_path_class is not None:
+            # folded into the type embedding: it reaches H_prev and the GRU input without changing their sizes
+            t = t + self.path_emb(torch.clamp(he_path_class, max=self.num_path_classes - 1))
         
         if he_angle_class is not None:
             angle_enc = self.angle_emb(torch.clamp(he_angle_class, max=NUM_ANGLE_CLASSES-1))
@@ -570,14 +623,15 @@ def edrop(edge_index, edge_attr, p: float, training: bool):
     return edge_index[:, keep], (edge_attr[keep] if edge_attr is not None else None)
 
 
-def hedrop(he_index, he_type, he_role, he_angle_class=None, p: float = 0.0, training: bool = False):
+def hedrop(he_index, he_type, he_role, he_angle_class=None, p: float = 0.0, training: bool = False,
+           he_path_class=None):
     if (not training) or p <= 0.0 or he_index.size(1) == 0: 
-        return he_index, he_type, he_role, he_angle_class
+        return he_index, he_type, he_role, he_angle_class, he_path_class
     
     H = he_type.size(0)
     keep = torch.rand(H, device=he_type.device) > p
     if keep.all(): 
-        return he_index, he_type, he_role, he_angle_class
+        return he_index, he_type, he_role, he_angle_class, he_path_class
     
     remap = -torch.ones(H, dtype=torch.long, device=he_type.device)
     remap[keep] = torch.arange(int(keep.sum()), device=he_type.device)
@@ -587,8 +641,9 @@ def hedrop(he_index, he_type, he_role, he_angle_class=None, p: float = 0.0, trai
     he_type_new = he_type[keep]
     he_role_new = he_role[keep_mem]
     he_angle_class_new = he_angle_class[keep] if he_angle_class is not None else None
+    he_path_class_new = he_path_class[keep] if he_path_class is not None else None
     
-    return he_index_new, he_type_new, he_role_new, he_angle_class_new
+    return he_index_new, he_type_new, he_role_new, he_angle_class_new, he_path_class_new
 
 
 class EdgeEncoder(nn.Module):
@@ -599,23 +654,24 @@ class EdgeEncoder(nn.Module):
 
 
 class LigandFieldBlock(nn.Module):
-    def __init__(self, d, bond_layer, dropout=0.1, prenorm=False):
+    def __init__(self, d, bond_layer, dropout=0.1, prenorm=False, num_path_classes: int = 0):
         super().__init__()
         self.bond = bond_layer
-        self.hyper = HyperCardinalDirectional(d, num_types=3)
+        self.hyper = HyperCardinalDirectional(d, num_types=3, num_path_classes=num_path_classes)
         self.norm_in = GraphNorm(d) if prenorm else None
         self.norm_mid = GraphNorm(d) if prenorm else None
         self.norm_out = GraphNorm(d)
         self.drop = nn.Dropout(p=dropout)
         self.prenorm = prenorm
 
-    def forward(self, x, edge_index, edge_attr, he_index, he_type, he_role, he_angle_class, batch, H_prev=None):
+    def forward(self, x, edge_index, edge_attr, he_index, he_type, he_role, he_angle_class, batch, H_prev=None,
+                he_path_class=None):
         h_lig = self.norm_in(x, batch) if self.prenorm else x
         h_lig = self.drop(self.bond(h_lig, edge_index, edge_attr))
         x_lig = x + h_lig
         
         h_hyp = self.norm_mid(x_lig, batch) if self.prenorm else x_lig
-        h_hyp, H_new = self.hyper(h_hyp, he_index, he_type, he_role, he_angle_class, H_prev)
+        h_hyp, H_new = self.hyper(h_hyp, he_index, he_type, he_role, he_angle_class, H_prev, he_path_class)
         h_hyp = self.drop(h_hyp)
         
         return self.norm_out(x_lig + h_hyp, batch), H_new
@@ -632,8 +688,9 @@ class AtomHyperNet(nn.Module):
     def __init__(self, d_in: int, d: int = 128, mpnn_pre=3, interleaved=3, hyper_only=0,
                  n_os: int = 0, n_cn: int = 0, n_geom: int = 0,
                  dropout: float = 0.1, edrop: float = 0.0, hedrop_p: float = 0.0,
-                 prenorm: bool = False):
+                 prenorm: bool = False, num_path_classes: int = 0):
         super().__init__()
+        self.use_path = num_path_classes > 0
         self.embed = nn.Linear(d_in, d)
         self.edge_encoder = EdgeEncoder(d)
         bond = lambda: GINEConv(MLP(d, p=dropout))
@@ -648,13 +705,13 @@ class AtomHyperNet(nn.Module):
 
         # Phase 2: Interleaved (optional, for feedback)
         self.blocks = nn.ModuleList([
-            LigandFieldBlock(d, bond(), dropout=dropout, prenorm=prenorm)
+            LigandFieldBlock(d, bond(), dropout=dropout, prenorm=prenorm, num_path_classes=num_path_classes)
             for _ in range(interleaved)
         ])
         
         # Phase 3: Hyper-only refinement (optional)
         self.hyper_post = nn.ModuleList([
-            HyperCardinalDirectional(d, num_types=3)
+            HyperCardinalDirectional(d, num_types=3, num_path_classes=num_path_classes)
             for _ in range(hyper_only)
         ])
 
@@ -675,10 +732,15 @@ class AtomHyperNet(nn.Module):
         ea = self.edge_encoder(data.edge_attr) if getattr(data, 'edge_attr', None) is not None else None
         ei, he_i, he_t, he_r = data.edge_index, data.he_index, data.he_type, data.he_role
         he_angle = getattr(data, 'he_angle_class', None)
+        he_path = getattr(data, 'he_path_class', None) if self.use_path else None
+        if self.use_path and he_path is None:
+            raise ValueError("model was built with num_path_classes > 0 but the data has no he_path_class "
+                             "(build it with BuildConfig(include_pair_path=True))")
 
         if self.training:
             ei, ea = edrop(ei, ea, self.edrop_p, True)
-            he_i, he_t, he_r, he_angle = hedrop(he_i, he_t, he_r, he_angle, p=self.hedrop_p, training=True)
+            he_i, he_t, he_r, he_angle, he_path = hedrop(he_i, he_t, he_r, he_angle, p=self.hedrop_p, training=True,
+                                                          he_path_class=he_path)
 
         # Phase 1: MPNN-only (ligand features mature before any hyperedge reasoning)
         for layer in self.mpnn_pre:
@@ -687,11 +749,11 @@ class AtomHyperNet(nn.Module):
         #Phase 2: ligand field loop
         H = None
         for blk in self.blocks:
-            x, H = blk(x, ei, ea, he_i, he_t, he_r, he_angle, data.batch, H_prev=H)
+            x, H = blk(x, ei, ea, he_i, he_t, he_r, he_angle, data.batch, H_prev=H, he_path_class=he_path)
 
         # Phase 3: Hyperedge-only refinement (no more bond updates)
         for hyper in self.hyper_post:
-            x, H = hyper(x, he_i, he_t, he_r, he_angle, H)
+            x, H = hyper(x, he_i, he_t, he_r, he_angle, H, he_path)
 
         g_atoms = global_mean_pool(x, data.batch)
 #        B = g_atoms.size(0)  # Actual batch size

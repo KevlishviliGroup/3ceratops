@@ -63,6 +63,23 @@ def _ensure_imports():
     _MODULES_LOADED = True
 
 
+def _num_pair_path_classes() -> int:
+    from .model import NUM_PAIR_PATH_CLASSES
+    return NUM_PAIR_PATH_CLASSES
+
+
+def build_config_from_checkpoint(cfg: dict):
+    """The hypergraph exactly as the checkpoint was trained on. The training script builds
+    BuildConfig(include_metal_dative=not args.no_dative, include_site_hyperedges=not args.no_site,
+    include_pair_path=args.pair_path), and args are saved as ckpt['config']."""
+    _ensure_imports()
+    return _BuildConfig(
+        include_metal_dative=not cfg.get('no_dative', False),
+        include_site_hyperedges=not cfg.get('no_site', False),
+        include_pair_path=cfg.get('pair_path', False),
+    )
+
+
 def _load_single_model(ckpt_path: str, d_in: int, device: torch.device) -> torch.nn.Module:
     """Load a single model from checkpoint."""
     _ensure_imports()
@@ -84,11 +101,13 @@ def _load_single_model(ckpt_path: str, d_in: int, device: torch.device) -> torch
         edrop=cfg.get('edrop', 0.0),
         hedrop_p=cfg.get('hedrop', 0.0),
         prenorm=cfg.get('prenorm', False),
+        num_path_classes=(_num_pair_path_classes() if cfg.get('pair_path', False) else 0),
     )
     
-    # Load EMA weights if available
+    # Load EMA weights if available. Strict: a checkpoint from a different architecture
+    # (e.g. trained with --pair_path) must fail loudly rather than leave layers at random init.
     if ckpt.get('ema') is not None:
-        model.load_state_dict(ckpt['ema'], strict=False)
+        model.load_state_dict(ckpt['ema'])
     else:
         model.load_state_dict(ckpt['model'])
     
@@ -121,10 +140,6 @@ class EnsemblePredictor:
         
         self.device = torch.device(device)
         self.project = project
-        self.cfg = _BuildConfig(
-            include_metal_dative=False,
-            include_site_hyperedges=True,
-        )
         self._model_dir = model_dir
         
         # Find checkpoints
@@ -142,6 +157,10 @@ class EnsemblePredictor:
         # Load aux_maps from first checkpoint (should be same across seeds)
         first_ckpt = torch.load(ckpt_paths[0], map_location=self.device, weights_only=False)
         self.aux_maps = first_ckpt['aux_maps']
+        # Build hypergraphs the way the checkpoints were trained. (This used to be hard-coded
+        # to include_metal_dative=False, while the ensemble was trained with metal-donor edges;
+        # on 300 test complexes that doubled the M-L distance error, 0.014 -> 0.026 A.)
+        self.cfg = build_config_from_checkpoint(first_ckpt['config'])
         
         # Determine d_in from a dummy forward pass
         # Use a simple heuristic: load one checkpoint config

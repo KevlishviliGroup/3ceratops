@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "3ceratops"
-version = "0.1.0"
+version = "0.2.0"
 description = "3D coordination-environment reconstruction from T-REX topology"
 readme = "README.md"
 license = {text = "MIT"}
