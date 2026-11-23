@@ -279,22 +279,47 @@ For each T-REX input, 3CERATOPS:
 3. reconstructs the metal-centered coordination environment;
 4. embeds the complete complex with multiple RDKit random seeds;
 5. performs constrained low-cost optimization on every successful seed;
-6. ranks the candidates by energy and refines the lowest-energy subset; and
+6. reads every candidate back to T-REX, ranks them by how well they match the
+   input and then by energy, and refines the best subset; and
 7. returns or writes the best final structure.
 
-The current pipeline ranks candidates without T-REX round-trip
-validation because reconstruction can be slow for select structures.
-For dataset generation, validate structures separately:
+### Embedding routes
+
+`--embed-method` (Python: `embed_method=`, or `$TREX_EMBED_METHOD`) selects how
+the ligands are placed around the reconstructed coordination sphere:
+
+- `native`: the metal is not bonded during embedding, so every ligand keeps the
+  Lewis structure written in its SMILES; metal distances are written directly
+  into the distance-geometry bounds.
+- `metallogen`: the MetalloGen route (metal replaced by a main-group dummy, bond
+  orders and charges re-derived with the LP solver).
+- `auto` (default): `native`; if that build fails or does not read back as the
+  input, build again with `metallogen` and keep the better structure.
+
+### T-REX round-trip check
+
+Candidates are read back with `trex.xyz_to_trex` and graded in tiers
+(`trex_geo.trex_match`), each including the previous ones:
+
+| Level | Tier | Meaning |
+|---:|---|---|
+| 0 | built | a structure exists, but its connectivity differs |
+| 1 | connectivity | same atoms and bonds (bond orders and charges ignored), same metal-donor bonds and hapticities |
+| 2 | trans map | ... and the same trans pairs |
+| 3 | chirality | ... and the same chirality where the input specifies one |
+| 4 | identical | the read-back is the input T-REX string |
+
+A structure is valid from level 3. Levels 1-2 compare graphs, so a different
+Lewis structure from the reader (a resonance form, a charge on another atom, a
+non-innocent ligand read as reduced) does not count against a structure.
+`result.diagnostics` carries `trex_valid` and `trex_level`; `--no-validate-trex`
+ranks by energy alone. To grade any structure:
 
 ```python
-from trex_geo.multiseed_trex_validate import validate_trex_roundtrip
+from trex_geo.trex_match import match_mol, match_structure
 
-is_valid, reconstructed = validate_trex_roundtrip(
-    mol=result.mol,
-    original_trex=trex_str,
-    charge=+3,
-    geometry="octahedral",
-)
+m = match_mol(result.mol, trex_str)        # or match_structure("file.xyz", trex_str)
+m.level, m.tier, m.valid, m.readback
 ```
 
 ## Haptic sites
@@ -321,6 +346,7 @@ geometry flags. The current mapping is:
 | Linear | `ln` | `L` | 2 |
 | Bent | `bnt` | - | 2 |
 | Trigonal planar | `trpl` | `TP` | 3 |
+| Trigonal prismatic | `TP` | `TP` | 6 |
 | Trigonal pyramidal | - | `TPY` | 3 |
 | T-shaped | `tsh` | - | 3 |
 | See-saw | `ssw` | - | 4 |
@@ -573,8 +599,8 @@ or filename-length truncation. The complete canonical string is retained in
   chemically appropriate structure for every valid T-REX input.
 - The LF-GNN ensemble predicts internal coordinates for chemistry represented
   in its training domain; out-of-domain predictions require additional care.
-- The default generation workflow does not perform T-REX round-trip validation.
-- For dataset generation, validate the returned structure separately.
+- Check `diagnostics['trex_valid']`: when no candidate reads back as the input,
+  the closest one is returned.
 - xTB and UMA energies are useful for screening but do not replace
   higher-level electronic-structure calculations.
 - Generated structures should be inspected and optimized at the intended DFT

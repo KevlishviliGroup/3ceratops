@@ -5,8 +5,8 @@ Multi-Seed Conformer Generation with T-REX Back-Validation.
 Workflow:
 1. Generate N embeddings with different random seeds  
 2. GFN-FF optimization on all (fast screening)
-3. T-REX back-validation using trex.xyz_to_trex
-4. Rank by energy, filter by T-REX validity
+3. T-REX back-validation using trex.xyz_to_trex, graded in tiers (trex_match)
+4. Rank by T-REX tier (valid = same connectivity, trans map and chirality), then energy
 5. Optional GFN2-xTB refinement on top K
 
 Usage:
@@ -53,6 +53,7 @@ class SeedResult:
     method: str = ""
     trex_valid: Optional[bool] = None  # None=not checked
     trex_reconstructed: Optional[str] = None
+    trex_level: Optional[int] = None  # trex_match tier: 0 built .. 4 identical; None=not checked
     error: str = ""
 
 
@@ -116,90 +117,89 @@ def canonicalize_trex_string(trex_str: str) -> Optional[str]:
         return None
 
 
+class _ReadBackTimeout(BaseException):
+    pass
+
+
+def match_roundtrip(
+    mol: Chem.Mol,
+    original_trex: str,
+    charge: int,
+    geometry: str = None,
+    work_dir: str = None,
+    timeout_seconds: int = 60,
+):
+    """
+    Read a conformer back to T-REX and grade it against the input (trex_match.TrexMatch:
+    level 0 built, 1 connectivity, 2 trans map, 3 chirality, 4 identical; valid from 3).
+    Bond orders and charges the reader assigns differently do not count against it.
+    Returns None if the read-back is unavailable or times out.
+    """
+    import signal
+
+    try:
+        from .trex_match import match_mol
+    except ImportError:
+        logger.debug("trex.xyz_to_trex not available")
+        return None
+
+    def timeout_handler(signum, frame):
+        # BaseException, so that no `except Exception` inside the reader swallows it
+        raise _ReadBackTimeout()
+
+    if work_dir is None:
+        work_dir = tempfile.mkdtemp(prefix="trex_validate_")
+    Path(work_dir).mkdir(exist_ok=True, parents=True)
+    use_alarm = hasattr(signal, "SIGALRM")
+    old_handler = None
+    try:
+        if use_alarm:
+            try:
+                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(timeout_seconds)
+            except ValueError:  # not in the main thread
+                use_alarm = False
+        return match_mol(mol, original_trex, charge=charge, geometry=geometry, work_dir=work_dir)
+    except _ReadBackTimeout:
+        logger.warning(f"T-REX validation timed out after {timeout_seconds}s")
+        return None
+    except Exception as e:
+        logger.warning(f"T-REX validation failed: {e}")
+        return None
+    finally:
+        if use_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+
 def validate_trex_roundtrip(
     mol: Chem.Mol,
     original_trex: str,
     charge: int,
     geometry: str = None,
     work_dir: str = None,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 60,
 ) -> Tuple[Optional[bool], Optional[str]]:
     """
-    Validate structure by converting back to T-REX and comparing.
-    
-    Uses trex.xyz_to_trex.xyz_to_trex_canonical which takes a FILE PATH.
-    
-    Args:
-        mol: Optimized RDKit molecule
-        original_trex: Original input T-REX string
-        charge: Total molecular charge
-        geometry: Optional geometry hint (e.g., "octahedral")
-        work_dir: Directory for temporary XYZ file
-        timeout_seconds: Max time for xyz_to_trex (default 30s)
-        
+    Validate structure by converting back to T-REX and comparing (see match_roundtrip).
+
     Returns:
         (is_valid, reconstructed_trex) - is_valid is None if validation unavailable/failed
     """
-    import signal
-    
-    class TimeoutError(Exception):
-        pass
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError("xyz_to_trex timed out")
-    
-    try:
-        from trex.xyz_to_trex import xyz_to_trex_canonical
-    except ImportError:
-        logger.debug("trex.xyz_to_trex not available")
+    m = match_roundtrip(mol, original_trex, charge, geometry=geometry, work_dir=work_dir,
+                        timeout_seconds=timeout_seconds)
+    if m is None:
         return None, None
-    
-    # Write mol to temporary XYZ file
-    if work_dir is None:
-        work_dir = tempfile.mkdtemp(prefix="trex_validate_")
-    work_path = Path(work_dir)
-    work_path.mkdir(exist_ok=True, parents=True)
-    
-    xyz_path = work_path / "structure.xyz"
-    
-    try:
-        write_xyz_file(mol, str(xyz_path))
-        
-        # Set timeout for xyz_to_trex
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(timeout_seconds)
-        
-        try:
-            # Convert XYZ back to canonical T-REX
-            reconstructed = xyz_to_trex_canonical(
-                str(xyz_path), 
-                overall_charge=charge,
-                geometry=geometry,
-            )
-        finally:
-            signal.alarm(0)  # Cancel the alarm
-            signal.signal(signal.SIGALRM, old_handler)  # Restore handler
-        
-        if reconstructed is None:
-            return False, None
-        
-        # Canonicalize original for comparison
-        original_canon = canonicalize_trex_string(original_trex)
-        
-        if original_canon is None:
-            # Fall back to direct comparison
-            is_valid = (original_trex.strip() == reconstructed.strip())
-        else:
-            is_valid = (original_canon.strip() == reconstructed.strip())
-        
-        return is_valid, reconstructed
-    
-    except TimeoutError:
-        logger.warning(f"T-REX validation timed out after {timeout_seconds}s")
-        return None, None
-    except Exception as e:
-        logger.warning(f"T-REX validation failed: {e}")
-        return None, None
+    return m.valid, m.readback
+
+
+def _check(r: "SeedResult", original_trex: str, charge: int, geometry: str, work_dir: str) -> None:
+    """Grade one conformer in place (trex_valid, trex_level, trex_reconstructed)."""
+    m = match_roundtrip(r.mol, original_trex, charge, geometry=geometry, work_dir=work_dir)
+    if m is None:
+        r.trex_valid, r.trex_level, r.trex_reconstructed = None, None, None
+    else:
+        r.trex_valid, r.trex_level, r.trex_reconstructed = m.valid, m.level, m.readback
 
 
 # =============================================================================
@@ -212,6 +212,7 @@ def generate_with_seeds(
     seeds: List[int],
     max_attempts_per_seed: int = 5,
     geometry: str = None,
+    haptic_scale: float = 0.35,
 ) -> List[SeedResult]:
     """
     Generate conformers with multiple random seeds.
@@ -238,6 +239,7 @@ def generate_with_seeds(
                 max_attempts=max_attempts_per_seed,
                 seed=seed,
                 geometry=geometry,
+                haptic_scale=haptic_scale,
             )
             
             results.append(SeedResult(
@@ -379,15 +381,7 @@ def validate_and_rank(
         seed_work_dir = work_path / f"validate_seed_{r.seed}"
         seed_work_dir.mkdir(exist_ok=True)
         
-        is_valid, reconstructed = validate_trex_roundtrip(
-            mol=r.mol,
-            original_trex=original_trex,
-            charge=charge,
-            geometry=geometry,
-            work_dir=str(seed_work_dir),
-        )
-        r.trex_valid = is_valid
-        r.trex_reconstructed = reconstructed
+        _check(r, original_trex, charge, geometry, str(seed_work_dir))
     
     # Filter successful ones
     valid = [r for r in results if r.success and r.energy < float('inf')]
@@ -395,17 +389,31 @@ def validate_and_rank(
     # Optionally filter by T-REX validity
     if require_trex_valid:
         valid = [r for r in valid if r.trex_valid is True]
-    
-    # Sort by energy
-    valid.sort(key=lambda r: r.energy)
-    
-    # Calculate relative energies
-    if valid:
-        e_min = valid[0].energy
-        for r in valid:
-            r.energy_kcal = (r.energy - e_min) * 627.509
-    
+
+    # Conformers that read back as the input T-REX (tier 3 or better) come first, then the
+    # closest tier, then energy. GFN-FF takes its topology from the starting geometry, so a
+    # conformer with an extra metal contact gets an extra bond term and often the lowest energy.
+    _rank(valid)
+
     return valid[:top_k]
+
+
+def _rank_level(r: SeedResult) -> int:
+    """Valid conformers (tier 3 and 4) rank equally; below that, the closer tier first."""
+    from .trex_match import VALID_LEVEL
+    if r.trex_level is None:
+        return -1
+    return min(r.trex_level, VALID_LEVEL)
+
+
+def _rank(results: List[SeedResult]) -> None:
+    """Sort in place: best T-REX tier first (valid ones together), then by energy;
+    energies relative to the lowest."""
+    results.sort(key=lambda r: (-_rank_level(r), r.energy))
+    if results:
+        e_min = min(r.energy for r in results)
+        for r in results:
+            r.energy_kcal = (r.energy - e_min) * 627.509
 
 
 # =============================================================================
@@ -431,6 +439,7 @@ def generate_and_validate(
     refine_gfn2: bool = True,
     skip_validation: bool = False,
     work_dir: str = None,
+    haptic_scale: float = 0.35,
 ) -> MultiSeedResult:
     """
     Main pipeline: generate, optimize, validate, rank.
@@ -472,7 +481,7 @@ def generate_and_validate(
     
     # Step 1: Generate embeddings
     logger.info("Step 1: Generating embeddings...")
-    results = generate_with_seeds(t, site_coords, seeds, geometry=geometry)
+    results = generate_with_seeds(t, site_coords, seeds, geometry=geometry, haptic_scale=haptic_scale)
     n_embed_ok = sum(1 for r in results if r.success)
     logger.info(f"  Embedding: {n_embed_ok}/{n_seeds}")
     
@@ -564,13 +573,20 @@ def generate_and_validate(
             method="GFN2-xTB",
             work_dir=str(gfn2_dir),
         )
-        # Re-sort by new energies
+        # Re-check the refined structures and re-rank
         selected = [r for r in selected if r.success]
-        selected.sort(key=lambda r: r.energy)
-        if selected:
-            e_min = selected[0].energy
+        if not skip_validation:
             for r in selected:
-                r.energy_kcal = (r.energy - e_min) * 627.509
+                seed_work_dir = work_path / "validate_gfn2" / f"seed_{r.seed}"
+                seed_work_dir.mkdir(exist_ok=True, parents=True)
+                _check(r, original_trex, charge, geometry_for_validation, str(seed_work_dir))
+            _rank(selected)
+        else:
+            selected.sort(key=lambda r: r.energy)
+            if selected:
+                e_min = selected[0].energy
+                for r in selected:
+                    r.energy_kcal = (r.energy - e_min) * 627.509
     
     best = selected[0] if selected else None
     if best:
@@ -607,5 +623,6 @@ __all__ = [
     'generate_and_validate',
     'validate_trex_roundtrip',
     'canonicalize_trex_string',
+    'match_roundtrip',
     'write_seed_xyz',
 ]

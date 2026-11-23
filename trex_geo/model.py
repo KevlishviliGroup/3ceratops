@@ -48,6 +48,7 @@ from trex.parse_full import parse_trex_full_string
 from trex.model import TrexFull
 from trex.trex2mol import trex_to_mol, SiteKey
 
+from .geometry_codes import get_trex_geometry_code
 from trex.geometry import (
     get_ideal_cis_cos,
     get_ideal_distance,
@@ -284,7 +285,7 @@ def _compute_ideal_cos_for_pair(T: TrexFull, site_i, site_j, is_trans: bool) -> 
     if is_trans:
         return IDEAL_TRANS_COS
     
-    geometry = T.G or T.get_geo_type()
+    geometry = get_trex_geometry_code(T)
     n_singles = len(T.singles)
     
     singles_set = {(s.lig, tuple(sorted(s.atoms))): idx for idx, s in enumerate(T.singles)}
@@ -498,7 +499,7 @@ def trex_to_hyperdata(trex_str: str, y: Optional[float] = None,
 
     os_val = int(getattr(T, 'ox', 0))
     cn_val = 2 * len(T.pairs) + len(T.singles)
-    try: geom_val = str(T.get_geo_type())
+    try: geom_val = str(get_trex_geometry_code(T))
     except: geom_val = str(getattr(T, 'G', 'UNK'))
 
     if aux_maps:
@@ -789,7 +790,7 @@ class TrexJSONLDataset(torch.utils.data.Dataset):
             T = parse_trex_full_string(r['text'])
             os_vals.add(int(getattr(T, 'ox', 0)))
             cn_vals.add(2*len(T.pairs) + len(T.singles))
-            try: geom_vals.add(str(T.get_geo_type()))
+            try: geom_vals.add(str(get_trex_geometry_code(T)))
             except: geom_vals.add(str(getattr(T, 'G', 'UNK')))
         self.aux_maps = {
             'os': {v:i for i,v in enumerate(sorted(os_vals))},

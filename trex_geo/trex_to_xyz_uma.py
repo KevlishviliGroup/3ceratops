@@ -40,6 +40,7 @@ from .trex_to_xyz import (
     scale_haptic_distances,
     TrexToXyzResult,
     _try_predict_internals,
+    unusable_prediction,
 )
 
 from .multiseed_trex_validate import (
@@ -47,6 +48,8 @@ from .multiseed_trex_validate import (
     MultiSeedResult,
     generate_with_seeds,
     validate_and_rank,
+    _check,
+    _rank,
 )
 
 from .uma_optimize import (
@@ -198,6 +201,7 @@ def generate_and_validate_uma(
     max_steps_medium: int = 300,
     max_steps_unconstrained: int = 500,
     work_dir: str = None,
+    haptic_scale: float = 0.35,
 ) -> MultiSeedResult:
     """
     Three-tier UMA pipeline: generate, optimize (small→medium→unconstrained), validate, rank.
@@ -257,7 +261,7 @@ def generate_and_validate_uma(
     # Step 1: Generate embeddings
     # =========================================================================
     logger.info("Step 1: Generating embeddings...")
-    results = generate_with_seeds(t, site_coords, seeds, geometry=geometry)
+    results = generate_with_seeds(t, site_coords, seeds, geometry=geometry, haptic_scale=haptic_scale)
     n_embed_ok = sum(1 for r in results if r.success)
     logger.info(f"  Embedding: {n_embed_ok}/{n_seeds}")
 
@@ -362,13 +366,20 @@ def generate_and_validate_uma(
             max_steps=max_steps_medium,
             work_dir=str(tier2_dir),
         )
-        # Re-sort by new energies
+        # Re-check the refined structures and re-rank
         selected = [r for r in selected if r.success]
-        selected.sort(key=lambda r: r.energy)
-        if selected:
-            e_min = selected[0].energy
+        if not skip_validation:
             for r in selected:
-                r.energy_kcal = (r.energy - e_min) * 627.509
+                seed_work_dir = work_path / "validate_tier2" / f"seed_{r.seed}"
+                seed_work_dir.mkdir(exist_ok=True, parents=True)
+                _check(r, original_trex, charge, geometry_for_validation, str(seed_work_dir))
+            _rank(selected)
+        else:
+            selected.sort(key=lambda r: r.energy)
+            if selected:
+                e_min = selected[0].energy
+                for r in selected:
+                    r.energy_kcal = (r.energy - e_min) * 627.509
 
     # =========================================================================
     # Step 5: Tier 3 — UMA unconstrained (optional, full relaxation)
@@ -443,6 +454,48 @@ def trex_to_xyz_uma(
     refine_unconstrained: bool = False,
     device: Optional[str] = None,
     work_dir: Optional[str] = None,
+    validate_trex: bool = True,
+    embed_method: Optional[str] = None,
+) -> TrexToXyzResult:
+    """
+    Convert T-REX string to 3D molecular structure using UMA optimization.
+
+    Same arguments as _trex_to_xyz_uma_once below, plus:
+        validate_trex: Read conformers back to T-REX and grade them (trex_match); ones with
+            the input's connectivity, trans map and chirality rank first (after tier 1, and
+            again after tier 2). diagnostics['trex_valid'] / ['trex_level'] describe the
+            returned one.
+        embed_method: "native", "metallogen" or "auto" (default: $TREX_EMBED_METHOD, else
+            "auto"; see embed_choice).
+    """
+    from .embed_choice import run_with_embed_method
+
+    return run_with_embed_method(
+        lambda: _trex_to_xyz_uma_once(
+            trex_str, internals=internals, use_idealized=use_idealized, model_path=model_path,
+            n_seeds=n_seeds, top_k=top_k, haptic_scale=haptic_scale, model_small=model_small,
+            model_medium=model_medium, refine_medium=refine_medium,
+            refine_unconstrained=refine_unconstrained, device=device, work_dir=work_dir,
+            validate_trex=validate_trex),
+        embed_method, validate_trex)
+
+
+def _trex_to_xyz_uma_once(
+    trex_str: str,
+    internals: Optional[dict] = None,
+    use_idealized: bool = False,
+    model_path: str = None,
+    n_seeds: int = 20,
+    top_k: int = 5,
+    haptic_scale: float = 0.35,
+    # UMA-specific
+    model_small: str = "uma-s-1p1",
+    model_medium: str = "uma-m-1p1",
+    refine_medium: bool = True,
+    refine_unconstrained: bool = False,
+    device: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    validate_trex: bool = True,
 ) -> TrexToXyzResult:
     """
     Convert T-REX string to 3D molecular structure using UMA optimization.
@@ -500,6 +553,7 @@ def trex_to_xyz_uma(
     # Determine internals source
     internals_source = "none"
     final_internals = None
+    prediction_rejected = None
     proj_error = None
 
     # Option 1: Use provided internals
@@ -519,7 +573,12 @@ def trex_to_xyz_uma(
     # Option 2: ML prediction
     if final_internals is None and not use_idealized:
         predicted = _try_predict_internals(trex_str, model_path)
-        if predicted is not None:
+        rejected = unusable_prediction(t, predicted) if predicted is not None else None
+        if rejected:
+            prediction_rejected = rejected
+            proj_error = predicted.get('proj_error', None)
+            logger.warning(f"ML prediction not buildable ({rejected}); using idealized internals")
+        elif predicted is not None:
             final_internals = predicted
             internals_source = "predicted"
             proj_error = predicted.get('proj_error', None)
@@ -579,7 +638,8 @@ def trex_to_xyz_uma(
     # Initial embedding to get metal_idx, coord_atom_indices
     try:
         test_result = embed_trex_metallogen(
-            t, site_coords, max_attempts=5, seed=42, geometry=geometry
+            t, site_coords, max_attempts=5, seed=42, geometry=geometry,
+            haptic_scale=haptic_scale,
         )
 
         if not test_result.success:
@@ -612,12 +672,9 @@ def trex_to_xyz_uma(
             m_centroid_dist=centroid_dist,
         ))
 
-    # Geometry for validation
-    geometry_for_xyz2trex = None
-    if geometry:
-        parts = geometry.split('_', 1)
-        if len(parts) == 2:
-            geometry_for_xyz2trex = parts[1].replace('_', ' ')
+    # Geometry hint for reading conformers back to T-REX
+    from .trex_match import geometry_hint
+    geometry_for_xyz2trex = geometry_hint(t)
 
     # Run UMA multi-seed pipeline
     try:
@@ -634,13 +691,14 @@ def trex_to_xyz_uma(
             geometry_for_validation=geometry_for_xyz2trex,
             n_seeds=n_seeds,
             top_k=top_k,
-            skip_validation=True,  # Skip T-REX validation for now
+            skip_validation=not validate_trex,
             model_small=model_small,
             model_medium=model_medium,
             refine_medium=refine_medium,
             refine_unconstrained=refine_unconstrained,
             device=device,
             work_dir=work_dir,
+            haptic_scale=haptic_scale,
         )
 
         if ms_result.best:
@@ -657,6 +715,13 @@ def trex_to_xyz_uma(
                     'best_seed': ms_result.best.seed,
                     'best_method': ms_result.best.method,
                     'optimizer': 'uma',
+                    'prediction_rejected': prediction_rejected,
+                    'n_trex_valid': ms_result.n_trex_valid if validate_trex else None,
+                    'trex_valid': ms_result.best.trex_valid,
+                    'trex_level': ms_result.best.trex_level,
+                    'trex_reconstructed': (ms_result.best.trex_reconstructed
+                                           if ms_result.best.trex_valid is False else None),
+                    'embed_method': test_result.diagnostics.get('method'),
                 },
             )
         else:
@@ -704,7 +769,9 @@ def trex_to_xyz_uma_file(
 
     with open(output_path, 'w') as f:
         f.write(f"{n}\n")
-        f.write(f"E={result.energy:.6f} source={result.internals_source} method={method}\n")
+        tv = (result.diagnostics or {}).get('trex_valid')
+        f.write(f"E={result.energy:.6f} source={result.internals_source} method={method}"
+                + ("" if tv is None else f" trex_valid={tv}") + "\n")
         for i in range(n):
             atom = mol.GetAtomWithIdx(i)
             pos = conf.GetAtomPosition(i)

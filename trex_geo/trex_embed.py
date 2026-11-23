@@ -2,7 +2,11 @@
 """
 T-REX Structure Embedding Module.
 
-This module faithfully replicates MetalloGen's embedding approach:
+embed_trex_metallogen() now runs the native route first (native_embed.py:
+ligands keep their SMILES Lewis structures, no LP) and falls back to the
+MetalloGen route below only if that fails; see its `method` argument.
+
+The MetalloGen route faithfully replicates MetalloGen's embedding approach:
 1. Parse ligand SMILES with AddHs to get complete molecules WITH HYDROGENS
 2. Build combined molecule with all ligand atoms
 3. Add ghost atoms for haptic sites
@@ -110,6 +114,7 @@ DUMMY_CENTER_BY_GEOMETRY = {
     '5_trigonal_bipyramidal': 15,  # P
     '6_hexagonal_planar': 26,   # Fe
     '6_octahedral': 26,         # Fe
+    '6_trigonal_prismatic': 26,  # Fe
     '6_pentagonal_pyramidal': 26,  # Fe
     '7_pentagonal_bipyramidal': 15,  # P  
 }
@@ -2036,6 +2041,48 @@ def restore_and_cleanup(
 # =============================================================================
 
 def embed_trex_metallogen(
+    t: 'TrexFull',
+    site_coords: np.ndarray,
+    max_attempts: int = 30,
+    seed: int = None,
+    geometry: str = None,
+    max_relaxation_level: int = 3,
+    reject_severe_clashes: bool = True,
+    method: Optional[str] = None,
+    haptic_scale: float = 0.35,
+) -> EmbedResult:
+    """
+    Embed a T-REX complex around its reconstructed coordination sphere.
+
+    method (default: $TREX_EMBED_METHOD, else "auto"):
+        "native"     ligands keep their SMILES Lewis structures; no LP
+                     (see native_embed.embed_trex_native)
+        "metallogen" the MetalloGen route below (LP bond orders, element swaps)
+        "auto"       native, then MetalloGen if native fails
+
+    The remaining arguments are shared; max_relaxation_level only affects
+    the MetalloGen route. haptic_scale is the factor trex_to_xyz applied to the
+    M-centroid distance of haptic sites (the MetalloGen ghost convention); the
+    native route divides it back out to place the ring centroid.
+    """
+    method = (method or os.environ.get("TREX_EMBED_METHOD") or "auto").lower()
+    if method not in ("auto", "native", "metallogen"):
+        raise ValueError(f"Unknown embedding method {method!r}; use auto, native or metallogen")
+    if method in ("auto", "native"):
+        from .native_embed import embed_trex_native
+        result = embed_trex_native(t, site_coords, max_attempts=min(max_attempts, 10), seed=seed,
+                                   geometry=geometry, reject_severe_clashes=reject_severe_clashes,
+                                   haptic_scale=haptic_scale)
+        if result.success or method == "native" or result.embedding_level_name == "collapsed_site":
+            return result
+        logger.info(f"Native embedding failed ({result.embedding_level_name}); trying the MetalloGen route")
+    result = _embed_trex_metallogen_route(t, site_coords, max_attempts, seed, geometry,
+                                          max_relaxation_level, reject_severe_clashes)
+    result.diagnostics.setdefault("method", "metallogen")
+    return result
+
+
+def _embed_trex_metallogen_route(
     t: 'TrexFull',
     site_coords: np.ndarray,
     max_attempts: int = 30,

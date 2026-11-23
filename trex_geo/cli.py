@@ -107,6 +107,8 @@ def _run_generate(args: argparse.Namespace) -> int:
             refine_gfn2=args.refine_gfn2,
             haptic_scale=args.haptic_scale,
             work_dir=args.work_dir,
+            validate_trex=args.validate_trex,
+            embed_method=args.embed_method,
         )
     else:
         from .trex_to_xyz_uma import trex_to_xyz_uma_file
@@ -125,6 +127,8 @@ def _run_generate(args: argparse.Namespace) -> int:
             refine_unconstrained=args.refine_unconstrained,
             device=args.device,
             work_dir=args.work_dir,
+            validate_trex=args.validate_trex,
+            embed_method=args.embed_method,
         )
 
     if not success:
@@ -249,7 +253,21 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--top-k", type=_positive_int)
     generate.add_argument("--haptic-scale", type=_positive_float, default=0.35)
     generate.add_argument("--work-dir")
+    generate.add_argument(
+        "--embed-method",
+        choices=("auto", "native", "metallogen"),
+        help="3D embedding route: native keeps ligand SMILES bonding (no LP); metallogen is the "
+        "LP route; auto (default) builds with native and, if that fails or does not read back as "
+        "the input T-REX, again with metallogen, keeping the better structure",
+    )
     generate.add_argument("--device", choices=("cpu", "cuda"))
+    generate.add_argument(
+        "--validate-trex",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="read each conformer back to T-REX and prefer the ones with the input's "
+        "connectivity, trans map and chirality (default: True)",
+    )
     generate.add_argument(
         "--refine-gfn2",
         action=argparse.BooleanOptionalAction,
